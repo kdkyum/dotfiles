@@ -1,7 +1,7 @@
 [user]
-	name = DongKyum Kim
-	email = kdkyum531@gmail.com
-[github]
+  name = DongKyum Kim
+  email = kdkyum531@gmail.com
+[github]  
   user = kdkyum
 [push]
   default = upstream
@@ -10,17 +10,21 @@
 [merge]
   ff = only
 [core]
-	editor = vim
-	excludesfile = ~/.gitignore_global
+  editor = vim
+  excludesfile = ~/.gitignore_global
   pager = less -F -X
 [color]
-	ui = true
+  ui = true
 [filter "lfs"]
-	clean = git-lfs clean %f
-	smudge = git-lfs smudge %f
-	required = true
+  clean = git-lfs clean %f
+  smudge = git-lfs smudge %f
+  required = true
 [alias]
-	sla = log --oneline --decorate --graph --all
-	car = commit --amend --no-edit
-	uncommit = reset --soft HEAD^
-	unstage = reset
+  aa = add --all
+  b = branch
+  ca = commit --amend
+  sla = log --oneline --decorate --graph --all
+  car = commit --amend --no-edit
+  co = checkout
+  uncommit = reset --soft HEAD^
+  unstage = reset
