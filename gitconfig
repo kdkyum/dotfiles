@@ -1,17 +1,20 @@
 [user]
 	name = DongKyum Kim
 	email = kdkyum531@gmail.com
+[github]
+  user = kdkyum
+[push]
+  default = upstream
+[fetch]
+  prune = true
+[merge]
+  ff = only
 [core]
 	editor = vim
-	excludesfile = /Users/dongkyumkim/.gitignore_global
+	excludesfile = ~/.gitignore_global
+  pager = less -F -X
 [color]
-	ui = auto
-[difftool "sourcetree"]
-	cmd = opendiff \"$LOCAL\" \"$REMOTE\"
-	path = 
-[mergetool "sourcetree"]
-	cmd = /Applications/SourceTree.app/Contents/Resources/opendiff-w.sh \"$LOCAL\" \"$REMOTE\" -ancestor \"$BASE\" -merge \"$MERGED\"
-	trustExitCode = true
+	ui = true
 [filter "lfs"]
 	clean = git-lfs clean %f
 	smudge = git-lfs smudge %f
