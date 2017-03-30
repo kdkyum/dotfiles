@@ -31,3 +31,5 @@
   co = checkout
   uncommit = reset --soft HEAD^
   unstage = reset
+[credential]
+	helper = store
