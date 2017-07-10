@@ -8,7 +8,6 @@
 [fetch]
   prune = true
 [merge]
-  ff = only
 [core]
   editor = vim
   excludesfile = ~/.gitignore_global
@@ -32,4 +31,4 @@
   uncommit = reset --soft HEAD^
   unstage = reset
 [credential]
-	helper = store
+	helper = cache --timeout=3600
