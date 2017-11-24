@@ -1,13 +1,5 @@
 " Specify a directory for plugins (for Neovim: ~/.local/share/nvim/plugged)
 call plug#begin('~/.vim/plugged')
-"
-" " Make sure you use single quotes
-"
-" Colors
-Plug 'tomasr/molokai'
-Plug 'chriskempson/vim-tomorrow-theme'
-Plug 'AlessandroYorba/Monrovia'
-Plug 'junegunn/seoul256.vim'
 
 " Edit
 Plug 'christoomey/vim-tmux-runner'
@@ -17,29 +9,11 @@ Plug 'tpope/vim-commentary'
 Plug 'tpope/vim-fugitive'
 Plug 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
 Plug 'junegunn/fzf.vim'
-Plug 'scrooloose/nerdtree', { 'on': 'NERDTreeToggle' }
-Plug 'honza/vim-snippets'
-" Plug 'Valloric/YouCompleteMe'
-" Plug 'python-mode/python-mode'
-" Plug 'scrooloose/syntastic', { 'on': 'SyntasticCheck' }
-
-" Plug 'SirVer/ultisnips'
-" Plug 'davidhalter/jedi-vim'
-Plug 'ervandew/supertab'
-Plug 'vim-airline/vim-airline'
-Plug 'vim-airline/vim-airline-themes'
-Plug 'jmcantrell/vim-virtualenv'
 
 call plug#end()
 
 " Leader
 let mapleader = " "
-
-" seoul256 (dark):
-let g:seoul256_background = 233
-colo seoul256
-
-let g:airline_theme='distinguished'
 
 " fzf keymapping
 nnoremap <C-p> :FZF $pwd<cr>
@@ -49,29 +23,6 @@ nnoremap <silent> <Leader>ag       :Ag <C-R><C-W><CR>
 nnoremap <silent> <Leader>AG       :Ag <C-R><C-A><CR>
 xnoremap <silent> <Leader>ag       y:Ag <C-R>"<CR>
 nnoremap <silent> <Leader>`        :Marks<CR>
-
-" nerdtree keymapping
-nnoremap <C-n> :NERDTreeToggle<cr>
-
-" YouCompleteMe settings
-" let g:ycm_autoclose_preview_window_after_completion=1
-map <leader>g  :YcmCompleter GoToDefinitionElseDeclaration<CR>
-
-" Jedi setup
-" let g:jedi#completions_enabled = 0
-" let g:jedi#use_tabs_not_buffers = 1
-" let g:jedi#show_call_signatures = "0"
-" let g:SuperTabDefaultCompletionType = "context"
-" let g:jedi#popup_on_dot = 0
-" set completeopt-=preview
-
-" " Trigger configuration. Do not use <tab> if you use https://github.com/Valloric/YouCompleteMe.
-" let g:UltiSnipsExpandTrigger="<tab>"
-" let g:UltiSnipsJumpForwardTrigger="<c-b>"
-" let g:UltiSnipsJumpBackwardTrigger="<c-z>"
-
-" If you want :UltiSnipsEdit to split your window.
-" let g:UltiSnipsEditSplit="vertical"
 
 set backspace=2   " Backspace deletes like most programs in insert mode
 set nobackup
@@ -100,11 +51,6 @@ endif
 
 if filereadable(expand("~/.vimrc.bundles"))
   source ~/.vimrc.bundles
-endif
-
-" Load matchit.vim, but only if the user hasn't installed a newer version.
-if !exists('g:loaded_matchit') && findfile('plugin/matchit.vim', &rtp) ==# ''
-  runtime! macros/matchit.vim
 endif
 
 filetype plugin indent on
