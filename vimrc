@@ -83,14 +83,11 @@ set shiftround
 set expandtab
 set wildmode=list:longest,list:full
 
-" Display extra whitespace
-set list listchars=tab:»·,trail:·,nbsp:·
-
 " Use one space, not two, after punctuation.
 set nojoinspaces
 
-" Make it obvious where 80 characters is
-set textwidth=80
+" Make it obvious where 120 characters is
+set textwidth=120
 set colorcolumn=+1
 
 " Numbers
