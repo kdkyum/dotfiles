@@ -8,7 +8,7 @@ sudo apt-get install rcm
 
 Then run
 ```
-EXCLUDES="README*.md *.sh"; rcup -d ~/dotfiles -x $EXCLUDES
+rcup -d ~/dotfiles -x "README*.md *.sh"
 ```
 
 Install ```tmux```
@@ -31,4 +31,10 @@ Install ```fzf```
 ```
 git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
 ~/.fzf/install
+```
+
+Install ```zsh-plugins``
+```
+git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+git clone https://github.com/zsh-users/zsh-autosuggestions $ZSH_CUSTOM/plugins/zsh-autosuggestions
 ```
