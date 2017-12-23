@@ -1,43 +1,66 @@
 # My dotfiles
-Install `rcm`
-```
+Install [`rcm`](https://github.com/thoughtbot/rcm)
+```bash
+# Ubuntu
 sudo add-apt-repository ppa:martin-frost/thoughtbot-rcm
 sudo apt-get update
 sudo apt-get install rcm
 ```
 
-Then run
+```bash
+# Mac OS X
+brew tap thoughtbot/formulae
+brew install rcm
 ```
+
+Then run
+```bash
 rcup -d ~/dotfiles -x "README*.md *.sh"
 ```
 
-Install `tmux`
-```
+Install [`tmux`](https://github.com/tmux/tmux) and [`tpm`](https://github.com/tmux-plugins/tpm)
+```bash
 bash tmux_build_from_source_Ubuntu.sh
+git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm
 ```
 
-Install `zsh`
-```
+Install [`zsh`](https://github.com/robbyrussell/oh-my-zsh/wiki/Installing-ZSH)
+```bash
+# Ubuntu
+sudo apt-get install zsh
 chsh -s $(which zsh)
 ```
 
-Install `Vim-Plug`
+```bash
+# Mac OS X
+brew install zsh zsh-completions
+chsh -s $(which zsh)
 ```
+
+Install [`Vim-Plug`](https://github.com/junegunn/vim-plug)
+```bash
 curl -fLo ~/.vim/autoload/plug.vim --create-dirs \
     https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
 ```
 
-Install `fzf`
-```
+Install [`fzf`](https://github.com/junegunn/fzf)
+```bash
 git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
 ~/.fzf/install
 ```
 
-Install `oh-my-zsh, zsh-plugins` and `zsh-themes`
-```
+Install [`oh-my-zsh`](https://github.com/robbyrussell/oh-my-zsh), [`zsh-plugins`]() and [`powerlevel9k`](https://github.com/bhilburn/powerlevel9k)
+```bash
 sh -c "$(wget https://raw.githubusercontent.com/robbyrussell/oh-my-zsh/master/tools/install.sh -O -)"
 
-git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
-git clone https://github.com/zsh-users/zsh-autosuggestions $ZSH_CUSTOM/plugins/zsh-autosuggestions
-git clone https://github.com/bhilburn/powerlevel9k.git ~/.oh-my-zsh/custom/themes/powerlevel9k
+git clone https://github.com/zsh-users/zsh-syntax-highlighting.git \ 
+    $ZSH_CUSTOM/plugins/zsh-syntax-highlighting
+
+git clone https://github.com/zsh-users/zsh-autosuggestions \
+    $ZSH_CUSTOM/plugins/zsh-autosuggestions
+    
+git clone https://github.com/bhilburn/powerlevel9k.git \ 
+    ~/.oh-my-zsh/custom/themes/powerlevel9k
 ```
+
+Install Powerline fonts from [`nerd-font`](https://github.com/ryanoasis/nerd-fonts)
