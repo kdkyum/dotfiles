@@ -9,8 +9,13 @@ Plug 'tpope/vim-commentary'
 Plug 'tpope/vim-fugitive'
 Plug 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
 Plug 'junegunn/fzf.vim'
+Plug 'vim-airline/vim-airline'
+Plug 'vim-airline/vim-airline-themes'
 
 call plug#end()
+
+let g:airline_theme='base16_google'
+let g:airline_powerline_fonts=1
 
 " Leader
 let mapleader = " "
@@ -112,7 +117,7 @@ nnoremap <silent> <Leader>a :TestSuite<CR>
 nnoremap <silent> <leader>gt :TestVisit<CR>
 
 " Run commands that require an interactive shell
-nnoremap <Leader>r :RunInInteractiveShell<space>
+nnoremap <Leader>r :source ~/.vimrc<CR>
 
 " Treat <li> and <p> tags like the block tags they are
 let g:html_indent_tags = 'li\|p'
