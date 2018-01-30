@@ -11,17 +11,20 @@ Plug 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
 Plug 'junegunn/fzf.vim'
 Plug 'vim-airline/vim-airline'
 Plug 'vim-airline/vim-airline-themes'
+Plug 'python-mode/python-mode'
 
 call plug#end()
 
-let g:airline_theme='base16_google'
+let g:airline_theme='base16_embers' "'bubblegum'
 let g:airline_powerline_fonts=1
+let g:airline#extensions#tabline#enabled = 1
+let g:airline#extensions#tabline#fnamemod = ':t'
 
 " Leader
 let mapleader = " "
 
 " fzf keymapping
-nnoremap <C-p> :FZF $pwd<cr>
+nnoremap <C-p> :FZF .<cr>
 nnoremap <silent> <Leader>C        :Colors<CR>
 nnoremap <silent> <Leader><Enter>  :Buffers<CR>
 nnoremap <silent> <Leader>ag       :Ag <C-R><C-W><CR>
@@ -33,7 +36,7 @@ set backspace=2   " Backspace deletes like most programs in insert mode
 set nobackup
 set nowritebackup
 set noswapfile    " http://robots.thoughtbot.com/post/18739402579/global-gitignore#comment-458413287
-set history=50
+set history=500
 set ruler         " show the cursor position all the time
 set showcmd       " display incomplete commands
 set incsearch     " do incremental searching
@@ -47,6 +50,12 @@ set laststatus=2  " Always display the status line
 set autowrite     " Automatically :write before running commands
 set relativenumber
 set mouse=a
+set clipboard=unnamed
+set so=7
+set hidden
+set lazyredraw
+set synmaxcol=128
+syntax sync minlines=256
 
 " Switch syntax highlighting on, when the terminal has colors
 " Also switch on highlighting the last used search pattern.
@@ -109,15 +118,22 @@ nnoremap <leader>w :update<cr>
 nnoremap <Leader>q :q<cr>
 nnoremap <Leader>Q :q!<cr>
 
-" vim-test mappings
-nnoremap <silent> <Leader>t :TestFile<CR>
-nnoremap <silent> <Leader>s :TestNearest<CR>
-nnoremap <silent> <Leader>l :TestLast<CR>
-nnoremap <silent> <Leader>a :TestSuite<CR>
-nnoremap <silent> <leader>gt :TestVisit<CR>
+" Buffers
+" This replaces :tabnew which I used to bind to this mapping
+nnoremap <leader>T :enew<cr>
+
+" Move to the next buffer
+nnoremap <leader>n :bnext<CR>
+
+" Move to the previous buffer
+nnoremap <leader>N :bprevious<CR>
+
+" Close the current buffer and move to the previous one
+" This replicates the idea of closing a tab
+nnoremap <leader>bq :bp <BAR> bd #<CR>
 
 " Run commands that require an interactive shell
-nnoremap <Leader>r :source ~/.vimrc<CR>
+":nnoremap <Leader>r :source ~/.vimrc<CR>
 
 " Treat <li> and <p> tags like the block tags they are
 let g:html_indent_tags = 'li\|p'
