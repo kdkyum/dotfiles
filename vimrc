@@ -11,11 +11,10 @@ Plug 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
 Plug 'junegunn/fzf.vim'
 Plug 'vim-airline/vim-airline'
 Plug 'vim-airline/vim-airline-themes'
-Plug 'python-mode/python-mode'
 
 call plug#end()
 
-let g:airline_theme='base16_embers' "'bubblegum'
+let g:airline_theme='base16_embers'
 let g:airline_powerline_fonts=1
 let g:airline#extensions#tabline#enabled = 1
 let g:airline#extensions#tabline#fnamemod = ':t'
