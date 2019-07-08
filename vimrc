@@ -107,6 +107,8 @@ set colorcolumn=+1
 set number
 set numberwidth=5
 
+nnoremap <leader>r :w<CR>:!clear;python %<CR>
+
 " Switch between the last two files
 nnoremap <leader><leader> <c-^>
 
