@@ -13,6 +13,10 @@ brew tap thoughtbot/formulae
 brew install rcm
 ```
 
+```bash
+curl -sL install-node.now.sh/lts | bash
+```
+
 Then run
 ```bash
 rcup -d ~/dotfiles -x "README*.md *.sh"

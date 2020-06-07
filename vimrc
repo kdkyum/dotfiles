@@ -7,14 +7,17 @@ Plug 'christoomey/vim-tmux-navigator'
 Plug 'tpope/vim-surround'
 Plug 'tpope/vim-commentary'
 Plug 'tpope/vim-fugitive'
+Plug 'neoclide/coc.nvim', {'branch': 'release'}
 Plug 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
 Plug 'junegunn/fzf.vim'
+Plug 'morhetz/gruvbox'
 Plug 'vim-airline/vim-airline'
 Plug 'vim-airline/vim-airline-themes'
 
 call plug#end()
 
-let g:airline_theme='base16_embers'
+colorscheme gruvbox
+
 let g:airline_powerline_fonts=1
 let g:airline#extensions#tabline#enabled = 1
 let g:airline#extensions#tabline#fnamemod = ':t'
@@ -55,6 +58,10 @@ set hidden
 set lazyredraw
 set synmaxcol=128
 syntax sync minlines=256
+
+if has('mouse_sgr')
+    set ttymouse=sgr
+endif
 
 " Switch syntax highlighting on, when the terminal has colors
 " Also switch on highlighting the last used search pattern.
@@ -159,9 +166,6 @@ set spellfile=$HOME/.vim-spell-en.utf-8.add
 
 " Autocomplete with dictionary words when spell check is on
 set complete+=kspell
-
-" Always use vertical diffs
-set diffopt+=vertical
 
 " Local config
 if filereadable($HOME . "/.vimrc.local")
