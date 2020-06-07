@@ -57,8 +57,9 @@ Install [`oh-my-zsh`](https://github.com/robbyrussell/oh-my-zsh), [`zsh-plugins`
 ```bash
 sh -c "$(wget https://raw.githubusercontent.com/robbyrussell/oh-my-zsh/master/tools/install.sh -O -)"
 
-git clone https://github.com/zsh-users/zsh-syntax-highlighting.git \ 
-    $ZSH_CUSTOM/plugins/zsh-syntax-highlighting
+git clone https://github.com/zdharma/fast-syntax-highlighting.git \
+    $ZSH_CUSTOM/plugins/fast-syntax-highlighting
+
 
 git clone https://github.com/zsh-users/zsh-autosuggestions \
     $ZSH_CUSTOM/plugins/zsh-autosuggestions
