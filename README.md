@@ -53,7 +53,7 @@ git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
 ~/.fzf/install
 ```
 
-Install [`oh-my-zsh`](https://github.com/robbyrussell/oh-my-zsh), [`zsh-plugins`]() and [`powerlevel9k`](https://github.com/bhilburn/powerlevel9k)
+Install [`oh-my-zsh`](https://github.com/robbyrussell/oh-my-zsh), [`zsh-plugins`](), [`powerlevel9k`](https://github.com/bhilburn/powerlevel9k), and [`sindresorhus/pure`](https://github.com/sindresorhus/pure)
 ```bash
 sh -c "$(wget https://raw.githubusercontent.com/robbyrussell/oh-my-zsh/master/tools/install.sh -O -)"
 
@@ -66,6 +66,8 @@ git clone https://github.com/zsh-users/zsh-autosuggestions \
     
 git clone https://github.com/bhilburn/powerlevel9k.git \ 
     ~/.oh-my-zsh/custom/themes/powerlevel9k
+
+npm install --global pure-prompt
 ```
 
 Install Powerline fonts from [`nerd-font`](https://github.com/ryanoasis/nerd-fonts)
