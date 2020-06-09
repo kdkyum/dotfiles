@@ -34,6 +34,7 @@ nnoremap <silent> <Leader>AG       :Ag <C-R><C-A><CR>
 xnoremap <silent> <Leader>ag       y:Ag <C-R>"<CR>
 nnoremap <silent> <Leader>`        :Marks<CR>
 
+set background=dark
 set backspace=2   " Backspace deletes like most programs in insert mode
 set nobackup
 set nowritebackup
