@@ -1,4 +1,5 @@
 # My dotfiles
+
 Install [`rcm`](https://github.com/thoughtbot/rcm)
 ```bash
 # Ubuntu
@@ -63,11 +64,63 @@ git clone https://github.com/zdharma/fast-syntax-highlighting.git \
 
 git clone https://github.com/zsh-users/zsh-autosuggestions \
     $ZSH_CUSTOM/plugins/zsh-autosuggestions
-    
-git clone https://github.com/bhilburn/powerlevel9k.git \ 
+
+git clone https://github.com/bhilburn/powerlevel9k.git \
     ~/.oh-my-zsh/custom/themes/powerlevel9k
 
 npm install --global pure-prompt
 ```
 
 Install Powerline fonts from [`nerd-font`](https://github.com/ryanoasis/nerd-fonts)
+
+## slurm-claude
+
+A script to launch persistent Claude Code sessions on SLURM compute nodes using tmux.
+
+### Setup
+
+Add `~/dotfiles/bin` to your PATH:
+```bash
+export PATH="$HOME/dotfiles/bin:$PATH"
+```
+
+Create a config file at `~/.config/slurm-claude/slurm-claude.conf`:
+```bash
+mkdir -p ~/.config/slurm-claude
+cat > ~/.config/slurm-claude/slurm-claude.conf << 'EOF'
+SLURM_CLAUDE_PARTITION="h100"
+SLURM_CLAUDE_ACCOUNT="aics_h100"
+EOF
+```
+
+### Usage
+
+```bash
+# Default: 12h, 1 GPU, 50G RAM, 10 CPUs
+slurm-claude
+
+# Custom time and GPUs
+slurm-claude -t 4-00:00 -g 2
+
+# All options
+slurm-claude -t 4-00:00 -g 2 -m 100G -c 20 -p h100sxm -a myaccount --constraint h100-nvl
+
+# Reconnect after detach (Ctrl+B, D) or disconnect
+slurm-claude --attach <JOB_ID>
+
+# Cancel the job when done
+scancel <JOB_ID>
+```
+
+### Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-t, --time` | Run time | `12:00:00` |
+| `-g, --gpus` | Number of GPUs | `1` |
+| `-m, --mem` | Memory | `50G` |
+| `-c, --cpus` | CPUs per task | `10` |
+| `-p, --partition` | SLURM partition | `gpu` |
+| `-a, --account` | SLURM account | (none) |
+| `--constraint` | Node feature | (none) |
+| `--attach JOB_ID` | Reattach to existing session | |
