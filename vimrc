@@ -7,7 +7,6 @@ Plug 'christoomey/vim-tmux-navigator'
 Plug 'tpope/vim-surround'
 Plug 'tpope/vim-commentary'
 Plug 'tpope/vim-fugitive'
-Plug 'neoclide/coc.nvim', {'branch': 'release'}
 Plug 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
 Plug 'junegunn/fzf.vim'
 Plug 'morhetz/gruvbox'
@@ -26,7 +25,7 @@ let g:airline#extensions#tabline#fnamemod = ':t'
 let mapleader = " "
 
 " fzf keymapping
-nnoremap <C-p> :FZF .<cr>
+nnoremap <C-p> :Files .<cr>
 nnoremap <silent> <Leader>C        :Colors<CR>
 nnoremap <silent> <Leader><Enter>  :Buffers<CR>
 nnoremap <silent> <Leader>ag       :Ag <C-R><C-W><CR>
@@ -83,7 +82,7 @@ augroup vimrcEx
   " Don't do it for commit messages, when the position is invalid, or when
   " inside an event handler (happens when dropping a file on gvim).
   autocmd BufReadPost *
-    \ if &ft != 'gitcommit' && line("'\"") > 0 && line("'\"") <= line("$") |
+    \ if &ft != 'gitcommit' && line("'\"" ) > 0 && line("'\"" ) <= line("$") |
     \   exe "normal g`\"" |
     \ endif
 
@@ -182,3 +181,9 @@ autocmd VimResized * :wincmd =
 " zoom a vim pane, <C-w>= to re-balance
 nnoremap <leader>- :wincmd _<cr>:wincmd \|<cr>
 nnoremap <leader>= :wincmd =<cr>
+
+if exists('$TMUX')
+  let g:fzf_layout = { 'tmux': '90%,70%' }
+else
+  let g:fzf_layout = { 'window': { 'width': 0.9, 'height': 0.6 } }
+endif

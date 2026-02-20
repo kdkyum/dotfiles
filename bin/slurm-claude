@@ -1,0 +1,152 @@
+#!/bin/bash
+# slurm-claude: Launch a persistent Claude Code session on SLURM compute nodes
+#
+# Usage:
+#   slurm-claude [OPTIONS]
+#   slurm-claude --attach JOB_ID
+#
+# Options:
+#   -t, --time TIME        Run time (default: 12:00:00)
+#   -g, --gpus N           Number of GPUs (default: 1)
+#   -m, --mem SIZE         Memory (default: 50G)
+#   -c, --cpus N           CPUs per task (default: 10)
+#   -p, --partition NAME   Partition (default: gpu)
+#   -a, --account NAME     SLURM account (optional)
+#   --constraint FEAT      Node constraint/feature (optional)
+#   --attach JOB_ID        Reattach to existing job's tmux session
+#   -h, --help             Show this help
+#
+# Config file: ~/.config/slurm-claude/slurm-claude.conf
+#   Example:
+#     SLURM_CLAUDE_TIME="12:00:00"
+#     SLURM_CLAUDE_GPUS=1
+#     SLURM_CLAUDE_MEM="50G"
+#     SLURM_CLAUDE_CPUS=10
+#     SLURM_CLAUDE_PARTITION="h100"
+#     SLURM_CLAUDE_ACCOUNT="aics_h100"
+#     SLURM_CLAUDE_CONSTRAINT="h100-nvl"
+
+# Load config file if exists
+if [ -f "$HOME/.config/slurm-claude/slurm-claude.conf" ]; then
+    source "$HOME/.config/slurm-claude/slurm-claude.conf"
+fi
+
+# Defaults (config file > env vars > hardcoded)
+TIME="${SLURM_CLAUDE_TIME:-12:00:00}"
+GPUS="${SLURM_CLAUDE_GPUS:-1}"
+MEM="${SLURM_CLAUDE_MEM:-50G}"
+CPUS="${SLURM_CLAUDE_CPUS:-10}"
+PARTITION="${SLURM_CLAUDE_PARTITION:-gpu}"
+ACCOUNT="${SLURM_CLAUDE_ACCOUNT:-}"
+CONSTRAINT="${SLURM_CLAUDE_CONSTRAINT:-}"
+ATTACH_JOB=""
+
+usage() {
+    sed -n '2,/^$/s/^# \?//p' "$0"
+    exit 0
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--time)       TIME="$2"; shift 2 ;;
+        -g|--gpus)       GPUS="$2"; shift 2 ;;
+        -m|--mem)        MEM="$2"; shift 2 ;;
+        -c|--cpus)       CPUS="$2"; shift 2 ;;
+        -p|--partition)  PARTITION="$2"; shift 2 ;;
+        -a|--account)    ACCOUNT="$2"; shift 2 ;;
+        --constraint)    CONSTRAINT="$2"; shift 2 ;;
+        --attach)        ATTACH_JOB="$2"; shift 2 ;;
+        -h|--help)       usage ;;
+        *) echo "Unknown option: $1"; usage ;;
+    esac
+done
+
+# Handle --attach mode
+if [ -n "$ATTACH_JOB" ]; then
+    NODE=$(squeue -j "$ATTACH_JOB" -h -o %N 2>/dev/null | grep -v '^$')
+    if [ -z "$NODE" ]; then
+        echo "Error: Job $ATTACH_JOB not found or not running"
+        exit 1
+    fi
+    echo "Attaching to tmux on job $ATTACH_JOB ($NODE)..."
+    srun --jobid="$ATTACH_JOB" --overlap --pty tmux attach-session -t claude
+    exit $?
+fi
+
+# Build optional SBATCH lines
+SBATCH_ACCOUNT=""
+SBATCH_CONSTRAINT=""
+if [ -n "$ACCOUNT" ]; then
+    SBATCH_ACCOUNT="#SBATCH --account=$ACCOUNT"
+fi
+if [ -n "$CONSTRAINT" ]; then
+    SBATCH_CONSTRAINT="#SBATCH --constraint=$CONSTRAINT"
+fi
+
+echo "Submitting SLURM job:"
+echo "  partition=$PARTITION  account=${ACCOUNT:-(none)}"
+echo "  time=$TIME  gpus=$GPUS  mem=$MEM  cpus=$CPUS"
+[ -n "$CONSTRAINT" ] && echo "  constraint=$CONSTRAINT"
+
+BATCH_SCRIPT=$(mktemp /tmp/slurm-claude-XXXXXX.sh)
+cat > "$BATCH_SCRIPT" <<EOF
+#!/bin/bash
+#SBATCH --partition=$PARTITION
+$SBATCH_ACCOUNT
+#SBATCH --gres=gpu:$GPUS
+#SBATCH -t $TIME
+#SBATCH --mem=$MEM
+#SBATCH --cpus-per-task=$CPUS
+$SBATCH_CONSTRAINT
+#SBATCH -o $HOME/slurm-claude-%j.out
+#SBATCH -J claude-session
+
+echo "Node: \$(hostname)"
+echo "Job started at \$(date)"
+
+# Start a tmux session that persists for the entire batch job
+tmux new-session -d -s claude
+tmux send-keys -t claude 'echo "Claude session ready on \$(hostname). Run: claude"' Enter
+
+# Keep job alive as long as tmux session exists
+while tmux has-session -t claude 2>/dev/null; do
+    sleep 30
+done
+echo "tmux session ended. Job finishing."
+EOF
+
+JOB_ID=$(sbatch --parsable "$BATCH_SCRIPT")
+rm -f "$BATCH_SCRIPT"
+
+if [ -z "$JOB_ID" ]; then
+    echo "Error: Failed to submit job"
+    exit 1
+fi
+
+echo "Job $JOB_ID submitted. Waiting for node allocation..."
+
+while true; do
+    STATE=$(squeue -j "$JOB_ID" -h -o %T 2>/dev/null)
+    if [ -z "$STATE" ]; then
+        echo "Error: Job $JOB_ID no longer in queue. Check ~/slurm-claude-${JOB_ID}.out"
+        exit 1
+    fi
+    NODE=$(squeue -j "$JOB_ID" -h -o %N 2>/dev/null | grep -v '^$')
+    if [ -n "$NODE" ] && [ "$STATE" = "RUNNING" ]; then
+        break
+    fi
+    echo "  Status: $STATE ..."
+    sleep 3
+done
+
+echo "Job $JOB_ID running on $NODE"
+echo "Attaching to tmux session..."
+echo "---"
+echo "Detach with: Ctrl+B, D (keeps job alive)"
+echo "Reconnect:   $0 --attach $JOB_ID"
+echo "Cancel job:  scancel $JOB_ID"
+echo "---"
+
+sleep 2
+srun --jobid="$JOB_ID" --overlap --pty tmux attach-session -t claude
