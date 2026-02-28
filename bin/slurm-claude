@@ -14,6 +14,7 @@
 #   -a, --account NAME     SLURM account (optional)
 #   -J, --job-name NAME    Job name (default: claude-session)
 #   --constraint FEAT      Node constraint/feature (optional)
+#   --exclude NODES        Exclude specific nodes (e.g. node01,node02)
 #   --attach JOB_ID|NAME   Reattach to existing job's tmux session
 #   -h, --help             Show this help
 #
@@ -27,6 +28,7 @@
 #     SLURM_CLAUDE_PARTITION="h100"
 #     SLURM_CLAUDE_ACCOUNT="aics_h100"
 #     SLURM_CLAUDE_CONSTRAINT="h100-nvl"
+#     SLURM_CLAUDE_EXCLUDE="node01,node02"
 #     SLURM_CLAUDE_JOB_NAME="claude-session"
 
 # Load config file if exists
@@ -42,6 +44,7 @@ CPUS="${SLURM_CLAUDE_CPUS:-10}"
 PARTITION="${SLURM_CLAUDE_PARTITION:-gpu}"
 ACCOUNT="${SLURM_CLAUDE_ACCOUNT:-}"
 CONSTRAINT="${SLURM_CLAUDE_CONSTRAINT:-}"
+EXCLUDE="${SLURM_CLAUDE_EXCLUDE:-}"
 JOB_NAME="${SLURM_CLAUDE_JOB_NAME:-claude-session}"
 ATTACH_JOB=""
 
@@ -61,6 +64,7 @@ while [[ $# -gt 0 ]]; do
         -a|--account)    ACCOUNT="$2"; shift 2 ;;
         -J|--job-name)   JOB_NAME="$2"; shift 2 ;;
         --constraint)    CONSTRAINT="$2"; shift 2 ;;
+        --exclude)       EXCLUDE="$2"; shift 2 ;;
         --attach)        ATTACH_JOB="$2"; shift 2 ;;
         -h|--help)       usage ;;
         *) echo "Unknown option: $1"; usage ;;
@@ -105,17 +109,22 @@ fi
 # Build optional SBATCH lines
 SBATCH_ACCOUNT=""
 SBATCH_CONSTRAINT=""
+SBATCH_EXCLUDE=""
 if [ -n "$ACCOUNT" ]; then
     SBATCH_ACCOUNT="#SBATCH --account=$ACCOUNT"
 fi
 if [ -n "$CONSTRAINT" ]; then
     SBATCH_CONSTRAINT="#SBATCH --constraint=$CONSTRAINT"
 fi
+if [ -n "$EXCLUDE" ]; then
+    SBATCH_EXCLUDE="#SBATCH --exclude=$EXCLUDE"
+fi
 
 echo "Submitting SLURM job:"
 echo "  name=$JOB_NAME  partition=$PARTITION  account=${ACCOUNT:-(none)}"
 echo "  time=$TIME  gpus=$GPUS  mem=$MEM  cpus=$CPUS"
 [ -n "$CONSTRAINT" ] && echo "  constraint=$CONSTRAINT"
+[ -n "$EXCLUDE" ] && echo "  exclude=$EXCLUDE"
 
 BATCH_SCRIPT=$(mktemp /tmp/slurm-claude-XXXXXX.sh)
 cat > "$BATCH_SCRIPT" <<EOF
@@ -127,6 +136,7 @@ $SBATCH_ACCOUNT
 #SBATCH --mem=$MEM
 #SBATCH --cpus-per-task=$CPUS
 $SBATCH_CONSTRAINT
+$SBATCH_EXCLUDE
 #SBATCH -o $HOME/slurm-claude-%j.out
 #SBATCH -J $JOB_NAME
 
