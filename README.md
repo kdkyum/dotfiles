@@ -18,6 +18,16 @@ dotfiles/
     └── tat
 ```
 
+## Install scripts
+
+```bash
+# slurm-claude
+curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/slurm-claude -o ~/.local/bin/slurm-claude && chmod +x ~/.local/bin/slurm-claude
+
+# tat
+curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/tat -o ~/.local/bin/tat && chmod +x ~/.local/bin/tat
+```
+
 ## Dependencies
 
 Install [`tmux`](https://github.com/tmux/tmux) and [`tpm`](https://github.com/tmux-plugins/tpm)
