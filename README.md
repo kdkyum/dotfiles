@@ -4,16 +4,16 @@
 
 ```
 dotfiles/
-├── vimrc
-├── tmux.conf
-├── gitconfig
+├── vimrc              → ~/.vimrc
+├── tmux.conf          → ~/.tmux.conf
+├── gitconfig          → ~/.gitconfig
 ├── config/
-│   ├── ghostty/
-│   └── starship.toml
-├── claude/
+│   ├── ghostty/       → ~/.config/ghostty/
+│   └── starship.toml  → ~/.config/starship.toml
+├── claude/            → ~/.claude/
 │   ├── settings.json
 │   └── hooks/
-└── local/bin/
+└── local/bin/         → ~/.local/bin/
     ├── slurm-claude
     └── tat
 ```
