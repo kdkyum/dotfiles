@@ -1,30 +1,33 @@
 #!/bin/bash
 read -r input
 
-message=$(echo "$input" | jq -r '.message // "Claude Code"')
-title=$(echo "$input" | jq -r '.title // empty')
-ntype=$(echo "$input" | jq -r '.notification_type // empty')
 hook_event=$(echo "$input" | jq -r '.hook_event_name // empty')
 
-case "$ntype" in
-  permission_prompt)   prefix="🔐 PERMISSION" ;;
-  idle_prompt)         prefix="💤 IDLE" ;;
-  auth_success)        prefix="✅ AUTH OK" ;;
-  elicitation_dialog)  prefix="❓ INPUT NEEDED" ;;
-  *)
-    if [ "$hook_event" = "Stop" ]; then
-      prefix="🏁 DONE"
+case "$hook_event" in
+  Stop)
+    prefix="DONE"
+    # Truncate last assistant message to keep notification short
+    msg=$(echo "$input" | jq -r '.last_assistant_message // empty' | head -c 120)
+    if [ -n "$msg" ]; then
+      alert="[$prefix] $msg"
     else
-      prefix="🔔 NOTIFY"
+      alert="[$prefix] Claude finished"
     fi
     ;;
+  PermissionRequest)
+    prefix="🔐 PERMISSION"
+    tool=$(echo "$input" | jq -r '.tool_name // "unknown"')
+    desc=$(echo "$input" | jq -r '.tool_input.description // .tool_input.command // .tool_input.pattern // .tool_input.file_path // empty' | head -c 100)
+    if [ -n "$desc" ]; then
+      alert="[$prefix] $tool: $desc"
+    else
+      alert="[$prefix] $tool"
+    fi
+    ;;
+  *)
+    alert="[🔔 NOTIFY] Claude Code"
+    ;;
 esac
-
-if [ -n "$title" ]; then
-  alert="[$prefix] $title — $message"
-else
-  alert="[$prefix] $message"
-fi
 
 if [ -n "$TMUX" ]; then
   printf '\033Ptmux;\033\033]9;%s\007\033\\' "$alert" > /dev/tty
