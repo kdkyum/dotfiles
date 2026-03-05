@@ -1,0 +1,28 @@
+# This is only for my local Macbook, you don't need this in remote server.
+# ── 테마/외관 ──
+term = "xterm-256color"
+
+font-size = 16
+
+cursor-style = bar
+mouse-hide-while-typing = true
+resize-overlay = never
+
+# ── Claude Code 필수 ──
+# Shift+Enter (줄바꿈) — Claude Code에서 기본 지원되지만 tmux 안에선 필요
+keybind = shift+enter=text:\x1b[13;2u
+
+# 알림 (Claude 작업 완료 시)
+desktop-notifications = true
+
+# ── 패널/탭 관리 ──
+keybind = ctrl+\=new_split:right
+keybind = ctrl+-=new_split:down
+keybind = cmd+w=close_surface
+
+# ── 클립보드 ──
+clipboard-trim-trailing-spaces = true
+
+# ── 기타 ──
+window-padding-balance = true
+confirm-close-surface = false

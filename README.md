@@ -1,45 +1,43 @@
 # My dotfiles
 
-Install [`rcm`](https://github.com/thoughtbot/rcm)
-```bash
-# Ubuntu
-sudo add-apt-repository ppa:martin-frost/thoughtbot-rcm
-sudo apt-get update
-sudo apt-get install rcm
+## Structure
+
+```
+dotfiles/
+├── vimrc              → ~/.vimrc
+├── tmux.conf          → ~/.tmux.conf
+├── gitconfig          → ~/.gitconfig
+├── config/
+│   ├── ghostty/       → ~/.config/ghostty/
+│   └── starship.toml  → ~/.config/starship.toml
+├── claude/            → ~/.claude/
+│   ├── settings.json
+│   └── hooks/
+└── local/bin/         → ~/.local/bin/
+    ├── slurm-claude
+    └── tat
 ```
 
+## Setup
+
+Create symlinks:
 ```bash
-# Mac OS X
-brew tap thoughtbot/formulae
-brew install rcm
+ln -sf ~/dotfiles/vimrc ~/.vimrc
+ln -sf ~/dotfiles/tmux.conf ~/.tmux.conf
+ln -sf ~/dotfiles/gitconfig ~/.gitconfig
+ln -sf ~/dotfiles/config/starship.toml ~/.config/starship.toml
+ln -sf ~/dotfiles/config/ghostty ~/.config/ghostty
+ln -sf ~/dotfiles/claude/settings.json ~/.claude/settings.json
+ln -sf ~/dotfiles/claude/hooks ~/.claude/hooks
+ln -sf ~/dotfiles/local/bin/slurm-claude ~/.local/bin/slurm-claude
+ln -sf ~/dotfiles/local/bin/tat ~/.local/bin/tat
 ```
 
-```bash
-curl -sL install-node.now.sh/lts | bash
-```
-
-Then run
-```bash
-rcup -d ~/dotfiles -x "README*.md *.sh"
-```
+## Dependencies
 
 Install [`tmux`](https://github.com/tmux/tmux) and [`tpm`](https://github.com/tmux-plugins/tpm)
 ```bash
-bash tmux_build_from_source_Ubuntu.sh
 git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm
-```
-
-Install [`zsh`](https://github.com/robbyrussell/oh-my-zsh/wiki/Installing-ZSH)
-```bash
-# Ubuntu
-sudo apt-get install zsh
-chsh -s $(which zsh)
-```
-
-```bash
-# Mac OS X
-brew install zsh zsh-completions
-chsh -s $(which zsh)
 ```
 
 Install [`Vim-Plug`](https://github.com/junegunn/vim-plug)
@@ -54,36 +52,16 @@ git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
 ~/.fzf/install
 ```
 
-Install [`oh-my-zsh`](https://github.com/robbyrussell/oh-my-zsh), [`zsh-plugins`](), [`powerlevel9k`](https://github.com/bhilburn/powerlevel9k), and [`sindresorhus/pure`](https://github.com/sindresorhus/pure)
+Install [`starship`](https://starship.rs/)
 ```bash
-sh -c "$(wget https://raw.githubusercontent.com/robbyrussell/oh-my-zsh/master/tools/install.sh -O -)"
-
-git clone https://github.com/zdharma/fast-syntax-highlighting.git \
-    $ZSH_CUSTOM/plugins/fast-syntax-highlighting
-
-
-git clone https://github.com/zsh-users/zsh-autosuggestions \
-    $ZSH_CUSTOM/plugins/zsh-autosuggestions
-
-git clone https://github.com/bhilburn/powerlevel9k.git \
-    ~/.oh-my-zsh/custom/themes/powerlevel9k
-
-npm install --global pure-prompt
+curl -sS https://starship.rs/install.sh | sh
 ```
-
-Install Powerline fonts from [`nerd-font`](https://github.com/ryanoasis/nerd-fonts)
 
 ## slurm-claude
 
 A script to launch persistent Claude Code sessions on SLURM compute nodes using tmux.
 
 ### Setup
-
-Add `~/dotfiles/bin` to your PATH:
-```bash
-export PATH="$HOME/dotfiles/bin:$PATH"
-```
-
 Create a config file at `~/.config/slurm-claude/slurm-claude.conf`:
 ```bash
 mkdir -p ~/.config/slurm-claude
