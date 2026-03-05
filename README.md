@@ -4,33 +4,18 @@
 
 ```
 dotfiles/
-├── vimrc              → ~/.vimrc
-├── tmux.conf          → ~/.tmux.conf
-├── gitconfig          → ~/.gitconfig
+├── vimrc
+├── tmux.conf
+├── gitconfig
 ├── config/
-│   ├── ghostty/       → ~/.config/ghostty/
-│   └── starship.toml  → ~/.config/starship.toml
-├── claude/            → ~/.claude/
+│   ├── ghostty/
+│   └── starship.toml
+├── claude/
 │   ├── settings.json
 │   └── hooks/
-└── local/bin/         → ~/.local/bin/
+└── local/bin/
     ├── slurm-claude
     └── tat
-```
-
-## Setup
-
-Create symlinks:
-```bash
-ln -sf ~/dotfiles/vimrc ~/.vimrc
-ln -sf ~/dotfiles/tmux.conf ~/.tmux.conf
-ln -sf ~/dotfiles/gitconfig ~/.gitconfig
-ln -sf ~/dotfiles/config/starship.toml ~/.config/starship.toml
-ln -sf ~/dotfiles/config/ghostty ~/.config/ghostty
-ln -sf ~/dotfiles/claude/settings.json ~/.claude/settings.json
-ln -sf ~/dotfiles/claude/hooks ~/.claude/hooks
-ln -sf ~/dotfiles/local/bin/slurm-claude ~/.local/bin/slurm-claude
-ln -sf ~/dotfiles/local/bin/tat ~/.local/bin/tat
 ```
 
 ## Dependencies
