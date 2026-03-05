@@ -15,6 +15,7 @@ dotfiles/
 │   └── hooks/
 └── local/bin/         → ~/.local/bin/
     ├── slurm-claude
+    ├── slurm-top
     └── tat
 ```
 
@@ -22,10 +23,20 @@ dotfiles/
 
 ```bash
 # slurm-claude
-curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/slurm-claude -o ~/.local/bin/slurm-claude && chmod +x ~/.local/bin/slurm-claude
+curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/slurm-claude \
+  -o ~/.local/bin/slurm-claude && chmod +x ~/.local/bin/slurm-claude
+```
 
+```bash
+# slurm-top
+curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/slurm-top \
+  -o ~/.local/bin/slurm-top && chmod +x ~/.local/bin/slurm-top
+```
+
+```bash
 # tat
-curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/tat -o ~/.local/bin/tat && chmod +x ~/.local/bin/tat
+curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/tat \
+  -o ~/.local/bin/tat && chmod +x ~/.local/bin/tat
 ```
 
 ## Dependencies
