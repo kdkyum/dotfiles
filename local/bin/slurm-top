@@ -629,7 +629,7 @@ def draw_job_table(win, y, jobs, width, scroll_offset, sort_key, current_user,
 
     cols = [
         ("JOBID", 10), ("PARTITION", 12), ("NAME", 24), ("USER", 10),
-        ("ST", 4), ("TIME", 12), ("NODES", 5), ("CPUS", 5),
+        ("ST", 4), ("TIME", 12), ("LIMIT", 12), ("NODES", 5), ("CPUS", 5),
         ("GRES", 12), ("REASON/NODELIST", 0),
     ]
     used = sum(c[1] for c in cols[:-1]) + len(cols)
@@ -656,7 +656,7 @@ def draw_job_table(win, y, jobs, width, scroll_offset, sort_key, current_user,
         row = ""
         for val, w in zip(
             [j["id"], j["partition"], j["name"], j["user"], st,
-             j["time"], j["nodes"], j["cpus"], gres_str, j["reason"]],
+             j["time"], j["time_limit"], j["nodes"], j["cpus"], gres_str, j["reason"]],
             [c[1] for c in cols]
         ):
             row += f" {val:<{w}}"
