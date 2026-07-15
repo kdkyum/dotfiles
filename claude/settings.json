@@ -10,14 +10,29 @@
       "WebFetch",
       "WebSearch",
       "Task",
-      "NotebookEdit"
+      "NotebookEdit",
+      "mcp__jlab-mcp__*"
     ],
     "deny": [
       "Bash(rm -rf *)",
       "Bash(sudo *)"
     ]
   },
+  "model": "claude-fable-5[1m]",
   "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Artifact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/upload-artifact-dropbox.sh",
+            "timeout": 120,
+            "statusMessage": "Uploading artifact to Dropbox..."
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
@@ -44,10 +59,22 @@
     "command": "bash ~/.claude/statusline.sh"
   },
   "enabledPlugins": {
-    "code-simplifier@claude-plugins-official": true,
-    "document-skills@anthropic-agent-skills": true,
-    "claude-md-management@claude-plugins-official": true,
-    "research-tools@kdkyum-research-tools": true
+    "code-simplifier@claude-plugins-official": false,
+    "claude-md-management@claude-plugins-official": false,
+    "skill-creator@claude-plugins-official": false,
+    "research-tools@kdkyum-research-tools": true,
+    "commit-commands@claude-plugins-official": false
   },
-  "effortLevel": "high"
+  "extraKnownMarketplaces": {
+    "kdkyum-research-tools": {
+      "source": {
+        "source": "github",
+        "repo": "kdkyum/research-tools"
+      }
+    }
+  },
+  "effortLevel": "high",
+  "tui": "fullscreen",
+  "theme": "dark",
+  "remoteControlAtStartup": false
 }
