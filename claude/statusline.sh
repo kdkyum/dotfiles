@@ -40,7 +40,7 @@ IFS=$'\t' read -r model_name size input_tokens cache_create cache_read \
     effort_level cwd duration_ms < <(
     echo "$input" | jq -r '[
         (.model.display_name // "Claude"),
-        (.context_window.context_window_size // 200000),
+        (.context_window.context_window_size // 0),
         (.context_window.current_usage.input_tokens // 0),
         (.context_window.current_usage.cache_creation_input_tokens // 0),
         (.context_window.current_usage.cache_read_input_tokens // 0),
@@ -51,7 +51,14 @@ IFS=$'\t' read -r model_name size input_tokens cache_create cache_read \
 )
 
 [ -n "$model_name" ] || model_name="Claude"
-is_num "$size" && [ "$size" -gt 0 ] || size=200000
+case "$model_name" in
+    gpt-5.6*) size=353000 ;;
+    *)
+        if ! is_num "$size" || [ "$size" -le 0 ]; then
+            size=200000
+        fi
+        ;;
+esac
 is_num "$input_tokens" || input_tokens=0
 is_num "$cache_create" || cache_create=0
 is_num "$cache_read"   || cache_read=0
