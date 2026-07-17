@@ -39,6 +39,33 @@ curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/ta
   -o ~/.local/bin/tat && chmod +x ~/.local/bin/tat
 ```
 
+## dbxcli (Dropbox CLI)
+
+The Claude artifact hook (`claude/hooks/upload-artifact-dropbox.sh`) uses
+[`dbxcli`](https://github.com/dropbox/dbxcli) to upload published artifacts to
+`/Apps/artifacts/`. Copy-paste to install the latest release into `~/.local/bin`
+(with checksum verification, no `sudo`):
+
+```bash
+# dbxcli → ~/.local/bin/dbxcli
+set -e
+mkdir -p ~/.local/bin
+tmp=$(mktemp -d)
+ver=$(curl -sL https://api.github.com/repos/dropbox/dbxcli/releases/latest \
+  | grep -o '"tag_name": *"v[^"]*"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+base="dbxcli_${ver}_linux_amd64"
+curl -sL -o "$tmp/$base.tar.gz" \
+  "https://github.com/dropbox/dbxcli/releases/download/v${ver}/${base}.tar.gz"
+curl -sL -o "$tmp/SHA256SUMS" \
+  "https://github.com/dropbox/dbxcli/releases/download/v${ver}/SHA256SUMS"
+( cd "$tmp" && grep "$base.tar.gz" SHA256SUMS | sha256sum -c - )
+tar -xzf "$tmp/$base.tar.gz" -C "$tmp"
+install -m 0755 "$tmp/$base/dbxcli" ~/.local/bin/dbxcli
+rm -rf "$tmp"
+dbxcli version
+# First run prompts for Dropbox OAuth; token is stored in ~/.config/dbxcli/auth.json
+```
+
 ## Dependencies
 
 Install [`tmux`](https://github.com/tmux/tmux) and [`tpm`](https://github.com/tmux-plugins/tpm)
