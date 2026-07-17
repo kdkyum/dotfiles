@@ -1,61 +1,60 @@
 #!/bin/bash
-input=$(cat)
 
-hook_event=$(echo "$input" | jq -r '.hook_event_name // empty')
+# Notification failures must never interrupt Claude Code.
+command -v jq >/dev/null 2>&1 || exit 0
+input=$(cat) || exit 0
 
-case "$hook_event" in
-  Stop)
-    prefix="DONE"
-    # Truncate last assistant message to keep notification short
-    msg=$(echo "$input" | jq -r '.last_assistant_message // empty' | tr '\n' ' ' | head -c 120)
-    if [ -n "$msg" ]; then
-      alert="[$prefix] $msg"
+# Sanitize untrusted model/tool text before it reaches a terminal sequence.
+# Truncation uses Unicode code points rather than bytes, so UTF-8 remains valid.
+alert=$(printf '%s' "$input" | jq -er '
+  def clean($limit):
+    tostring
+    | explode
+    | map(
+        if . == 59 then 44
+        elif . < 32 or (. >= 127 and . <= 159) then 32
+        else .
+        end
+      )
+    | implode
+    | gsub(" +"; " ")
+    | sub("^ +"; "")
+    | sub(" +$"; "")
+    | explode
+    | .[:$limit]
+    | implode
+    | sub(" +$"; "");
+
+  (.hook_event_name // "") as $event
+  | if $event == "Stop" then
+      (.last_assistant_message // "" | clean(120)) as $message
+      | if $message == "" then
+          "[DONE] Claude finished"
+        else
+          "[DONE] \($message)"
+        end
+    elif $event == "PermissionRequest" then
+      (.tool_name // "unknown" | clean(60)) as $tool
+      | (
+          .tool_input.description
+          // .tool_input.command
+          // .tool_input.pattern
+          // .tool_input.file_path
+          // ""
+          | clean(100)
+        ) as $description
+      | if $description == "" then
+          "[🔐 PERMISSION] \($tool)"
+        else
+          "[🔐 PERMISSION] \($tool): \($description)"
+        end
     else
-      alert="[$prefix] Claude finished"
-    fi
-    ;;
-  PermissionRequest)
-    prefix="🔐 PERMISSION"
-    tool=$(echo "$input" | jq -r '.tool_name // "unknown"')
-    desc=$(echo "$input" | jq -r '.tool_input.description // .tool_input.command // .tool_input.pattern // .tool_input.file_path // empty' | tr '\n' ' ' | head -c 100)
-    if [ -n "$desc" ]; then
-      alert="[$prefix] $tool: $desc"
-    else
-      alert="[$prefix] $tool"
-    fi
-    ;;
-  *)
-    alert="[🔔 NOTIFY] Claude Code"
-    ;;
-esac
+      "[🔔 NOTIFY] Claude Code"
+    end
+') || exit 0
 
-# Pick ttys to write to, in order of preference:
-#   1. attached tmux client(s) — works even without a controlling terminal
-#   2. /dev/tty if the hook happens to have one
-#   3. all login ttys owned by this user (no tmux, hook has no tty)
-target_ttys=""
-if command -v tmux >/dev/null 2>&1; then
-  target_ttys=$(tmux list-clients -F '#{client_tty}' 2>/dev/null)
-fi
-if [ -z "$target_ttys" ] && (: > /dev/tty) 2>/dev/null; then
-  target_ttys=/dev/tty
-fi
-if [ -z "$target_ttys" ]; then
-  target_ttys=$(who 2>/dev/null | awk -v u="$USER" '$1 == u {print "/dev/" $2}')
-fi
-[ -n "$target_ttys" ] || exit 0
-
-# OSC 777 carries title + body (Ghostty/urxvt-style); fall back to OSC 9
-# (iTerm2-style, body only) for terminals that don't speak it. A BEL rings
-# the terminal bell so unsupported emulators still flag activity/urgency.
-# Strip semicolons from the body so they don't break OSC 777 field parsing.
-body=${alert//;/,}
-for tty in $target_ttys; do
-  [ -w "$tty" ] || continue
-  {
-    printf '\033]777;notify;Claude;%s\033\\' "$body"
-    printf '\033]9;Claude — %s\033\\' "$body"
-    printf '\a'
-  } > "$tty" 2>/dev/null
-done
+# Claude Code routes terminalSequence through the originating interface. Emit one
+# OSC 777 notification only; direct TTY broadcasts, OSC 9, and BEL are avoided.
+terminal_sequence=$(printf '\033]777;notify;Claude;%s\033\\' "$alert")
+jq -nc --arg terminalSequence "$terminal_sequence" '{terminalSequence: $terminalSequence}'
 exit 0

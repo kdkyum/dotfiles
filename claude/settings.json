@@ -19,6 +19,7 @@
     ]
   },
   "model": "claude-fable-5[1m]",
+  "preferredNotifChannel": "notifications_disabled",
   "hooks": {
     "PostToolUse": [
       {
