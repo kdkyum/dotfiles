@@ -17,7 +17,8 @@ REFRESH_INTERVAL = 3  # seconds
 
 def run_cmd(cmd, timeout=10):
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
         return r.stdout.strip()
     except Exception:
         return ""
@@ -142,56 +143,105 @@ def get_node_summary():
 
 
 def get_gpu_info():
-    """Get real GPU total/allocated per partition from node-level data.
+    """Aggregate GPU totals/allocations per GPU type from node-level data.
 
-    Returns (gpu_per_partition, total_gpus, total_alloc) where
-    gpu_per_partition = {partition: {"total": N, "alloc": N}}.
+    Returns (gpu_by_type, node_types, total_gpus, total_alloc) where
+    gpu_by_type = {type: {"total": N, "alloc": N, "nodes": N, "unavail": N}}
+    and node_types = {node_name: gpu_type}.
     """
     raw = run_cmd('scontrol show nodes', timeout=15)
-    per_partition = defaultdict(lambda: {"total": 0, "alloc": 0})
+    by_type = defaultdict(lambda: {"total": 0, "alloc": 0, "nodes": 0, "unavail": 0})
+    node_types = {}
     total_gpus = 0
     total_alloc = 0
-    node_partitions = []
-    cfg_gpu = 0
-    alloc_gpu = 0
-    seen_nodes = set()
+
+    node_name = ""
+    cfg = {}
+    alloc = {}
+    unavail = False
+
+    def flush():
+        nonlocal total_gpus, total_alloc
+        for t, n in cfg.items():
+            e = by_type[t]
+            e["total"] += n
+            e["nodes"] += 1
+            a = alloc.get(t, 0)
+            e["alloc"] += a
+            if unavail:
+                e["unavail"] += n
+            total_gpus += n
+            total_alloc += a
 
     for line in raw.splitlines():
         line = line.strip()
         if line.startswith("NodeName="):
-            # Process previous node
-            if node_partitions and cfg_gpu > 0:
-                for p in node_partitions:
-                    per_partition[p]["total"] += cfg_gpu
-                    per_partition[p]["alloc"] += alloc_gpu
-            # Reset for new node
+            if cfg:
+                flush()
             node_name = line.split()[0].split("=", 1)[1]
-            node_partitions = []
-            cfg_gpu = 0
-            alloc_gpu = 0
-        elif line.startswith("Partitions="):
-            node_partitions = [p.strip() for p in line.split("=", 1)[1].split(",")]
+            cfg = {}
+            alloc = {}
+            unavail = False
+        elif line.startswith("State="):
+            state = line.split()[0].split("=", 1)[1].upper()
+            unavail = any(s in state for s in ("DOWN", "DRAIN", "MAINT", "FAIL"))
         elif line.startswith("CfgTRES="):
-            m = re.search(r'gres/gpu=(\d+)', line)
-            if m:
-                cfg_gpu = int(m.group(1))
-                if node_name not in seen_nodes:
-                    total_gpus += cfg_gpu
-                    seen_nodes.add(node_name)
+            for m in re.finditer(r'gres/gpu:([\w.]+)=(\d+)', line):
+                cfg[m.group(1)] = int(m.group(2))
+                node_types[node_name] = m.group(1)
+            if not cfg:
+                m = re.search(r'gres/gpu=(\d+)', line)
+                if m and int(m.group(1)) > 0:
+                    cfg["gpu"] = int(m.group(1))
+                    node_types[node_name] = "gpu"
         elif line.startswith("AllocTRES="):
-            m = re.search(r'gres/gpu=(\d+)', line)
-            if m:
-                alloc_gpu = int(m.group(1))
-                if node_name in seen_nodes:
-                    total_alloc += alloc_gpu
+            for m in re.finditer(r'gres/gpu:([\w.]+)=(\d+)', line):
+                alloc[m.group(1)] = int(m.group(2))
+            if not alloc:
+                m = re.search(r'gres/gpu=(\d+)', line)
+                if m:
+                    alloc["gpu"] = int(m.group(1))
+    if cfg:
+        flush()
 
-    # Process last node
-    if node_partitions and cfg_gpu > 0:
-        for p in node_partitions:
-            per_partition[p]["total"] += cfg_gpu
-            per_partition[p]["alloc"] += alloc_gpu
+    return dict(by_type), node_types, total_gpus, total_alloc
 
-    return dict(per_partition), total_gpus, total_alloc
+
+def expand_nodelist(nodelist):
+    """Expand a compact Slurm nodelist like 'daisg[101-103,105]' to node names."""
+    nodes = []
+    for m in re.finditer(r'([^,\[]+)(?:\[([^\]]+)\])?,?', nodelist):
+        prefix, ranges = m.group(1), m.group(2)
+        if not ranges:
+            nodes.append(prefix)
+            continue
+        for r in ranges.split(","):
+            try:
+                if "-" in r:
+                    a, b = r.split("-", 1)
+                    for i in range(int(a), int(b) + 1):
+                        nodes.append(f"{prefix}{i:0{len(a)}d}")
+                else:
+                    nodes.append(prefix + r)
+            except ValueError:
+                continue
+    return nodes
+
+
+def job_gpu_type(job, node_types):
+    """Resolve a job's GPU type from its GRES string or its allocated nodes."""
+    gres = job.get("gres", "")
+    m = re.search(r'gpu:([A-Za-z_][\w.]*):', gres)
+    if m:
+        return m.group(1)
+    if "gpu" not in gres:
+        return ""
+    if job.get("state") == "RUNNING":
+        for n in expand_nodelist(job.get("reason", "")):
+            t = node_types.get(n)
+            if t:
+                return t
+    return "any"
 
 
 def get_jobs():
@@ -473,35 +523,53 @@ def draw_header(win, y, width, current_user, view_name):
     return y + 1
 
 
-def draw_partition_bars(win, y, partitions, gpu_info, total_gpus, total_gpu_alloc, width):
-    safe_addstr(win, y, 1, "PARTITIONS", curses.color_pair(4) | curses.A_BOLD)
-    y += 1
+def draw_partition_bars(win, y, partitions, gpu_by_type, total_gpus, total_gpu_alloc, width):
     bar_width = min(50, width - 40)
     if bar_width < 10:
         bar_width = 10
     label_width = 20  # fixed column where bars start
-    info_col = label_width + bar_width + 22  # fixed column for LIMIT/DEVICE
+    info_col = label_width + bar_width + 22  # fixed column for NODES/LIMIT
 
-    # Total GPU summary bar
+    # ── GPUs by type ──
+    safe_addstr(win, y, 1, "GPUs BY TYPE", curses.color_pair(4) | curses.A_BOLD)
+    if info_col + 12 < width:
+        safe_addstr(win, y, info_col, "NODES", curses.color_pair(7) | curses.A_DIM)
+    y += 1
+
     if total_gpus > 0:
-        gpu_frac = total_gpu_alloc / total_gpus if total_gpus > 0 else 0
+        gpu_frac = total_gpu_alloc / total_gpus
         label = f" {'Total':>14s} GPU"
         safe_addstr(win, y, 0, label, curses.color_pair(6) | curses.A_BOLD)
         draw_bar(win, y, label_width, bar_width, gpu_frac, f"{total_gpu_alloc}/{total_gpus}")
-        y += 2
+        y += 1
+
+    for gtype in sorted(gpu_by_type, key=lambda t: gpu_by_type[t]["total"], reverse=True):
+        if y >= win.getmaxyx()[0] - 2:
+            break
+        g = gpu_by_type[gtype]
+        frac = g["alloc"] / g["total"] if g["total"] > 0 else 0
+        name_str = f" {gtype.upper():>18s}"
+        safe_addstr(win, y, 0, name_str, curses.color_pair(6))
+        draw_bar(win, y, label_width, bar_width, frac, f"{g['alloc']}/{g['total']}")
+        if info_col < width:
+            info = f"{g['nodes']} nodes"
+            safe_addstr(win, y, info_col, info, curses.color_pair(7) | curses.A_DIM)
+            if g["unavail"] > 0:
+                safe_addstr(win, y, info_col + len(info), f" ({g['unavail']} unavail)",
+                            curses.color_pair(3))
+        y += 1
+    y += 1
+
+    # ── Partition CPUs ──
+    safe_addstr(win, y, 1, "PARTITIONS (CPU)", curses.color_pair(4) | curses.A_BOLD)
+    if info_col + 12 < width:
+        safe_addstr(win, y, info_col, "LIMIT", curses.color_pair(7) | curses.A_DIM)
+    y += 1
 
     sorted_parts = sorted(
         partitions.values(),
         key=lambda p: (not p["default"], not p["has_gpu"], p["name"])
     )
-
-    # Column header
-    hdr_label = f" {'PARTITION':>14s}    "
-    safe_addstr(win, y, 0, hdr_label, curses.color_pair(7) | curses.A_DIM)
-    if info_col + 12 < width:
-        safe_addstr(win, y, info_col, "LIMIT/DEVICE", curses.color_pair(7) | curses.A_DIM)
-    y += 1
-
     for p in sorted_parts:
         if y >= win.getmaxyx()[0] - 2:
             break
@@ -515,17 +583,6 @@ def draw_partition_bars(win, y, partitions, gpu_info, total_gpus, total_gpu_allo
         if tl and info_col < width:
             safe_addstr(win, y, info_col, tl, curses.color_pair(7) | curses.A_DIM)
         y += 1
-        if p["has_gpu"] and p["gpu_per_node"] > 0:
-            gi = gpu_info.get(p["name"], {})
-            gpu_total = gi.get("total", 0)
-            gpu_alloc = gi.get("alloc", 0)
-            gpu_frac = gpu_alloc / gpu_total if gpu_total > 0 else 0
-            gname = f" {'GPU':>18s}"
-            safe_addstr(win, y, 0, gname, curses.color_pair(6))
-            draw_bar(win, y, label_width, bar_width, gpu_frac, f"{gpu_alloc}/{gpu_total}")
-            if p.get("gpu_type") and info_col < width:
-                safe_addstr(win, y, info_col, p["gpu_type"], curses.color_pair(6))
-            y += 1
     return y + 1
 
 
@@ -576,7 +633,7 @@ def draw_node_summary(win, y, node_states, width):
 
 
 def draw_job_table(win, y, jobs, width, scroll_offset, sort_key, current_user,
-                   show_all, filter_user, filter_partition):
+                   show_all, filter_user, filter_partition, filter_gpu_type, node_types):
     max_y = win.getmaxyx()[0]
     title = "JOBS"
     filters = []
@@ -586,6 +643,8 @@ def draw_job_table(win, y, jobs, width, scroll_offset, sort_key, current_user,
         filters.append("my jobs")
     if filter_partition:
         filters.append(f"partition: {filter_partition}")
+    if filter_gpu_type:
+        filters.append(f"gpu: {filter_gpu_type}")
     if filters:
         title += f" ({', '.join(filters)})"
     elif show_all:
@@ -604,6 +663,9 @@ def draw_job_table(win, y, jobs, width, scroll_offset, sort_key, current_user,
         display_jobs = [j for j in display_jobs if j["user"] == current_user]
     if filter_partition:
         display_jobs = [j for j in display_jobs if j["partition"] == filter_partition]
+    if filter_gpu_type:
+        display_jobs = [j for j in display_jobs
+                        if job_gpu_type(j, node_types).lower() == filter_gpu_type.lower()]
 
     sort_funcs = {
         "id": lambda j: int(j["id"]) if j["id"].isdigit() else 0,
@@ -629,8 +691,8 @@ def draw_job_table(win, y, jobs, width, scroll_offset, sort_key, current_user,
 
     cols = [
         ("JOBID", 10), ("PARTITION", 12), ("NAME", 24), ("USER", 10),
-        ("ST", 4), ("TIME", 12), ("NODES", 5), ("CPUS", 5),
-        ("GRES", 12), ("REASON/NODELIST", 0),
+        ("ST", 4), ("TIME", 12), ("LIMIT", 12), ("NODES", 5), ("CPUS", 5),
+        ("GPU", 14), ("REASON/NODELIST", 0),
     ]
     used = sum(c[1] for c in cols[:-1]) + len(cols)
     cols[-1] = (cols[-1][0], max(10, width - used - 2))
@@ -652,11 +714,17 @@ def draw_job_table(win, y, jobs, width, scroll_offset, sort_key, current_user,
             break
         j = display_jobs[idx]
         st = {"RUNNING": "R", "PENDING": "PD", "COMPLETING": "CG"}.get(j["state"], j["state"][:2])
-        gres_str = j["gres"] if j["gres"] and j["gres"] != "N/A" else ""
+        gtype = job_gpu_type(j, node_types)
+        if gtype:
+            m = re.search(r'gpu[:\w]*?:(\d+)', j["gres"])
+            count = m.group(1) if m else "?"
+            gres_str = f"{gtype}:{count}"
+        else:
+            gres_str = ""
         row = ""
         for val, w in zip(
             [j["id"], j["partition"], j["name"], j["user"], st,
-             j["time"], j["nodes"], j["cpus"], gres_str, j["reason"]],
+             j["time"], j["time_limit"], j["nodes"], j["cpus"], gres_str, j["reason"]],
             [c[1] for c in cols]
         ):
             row += f" {val:<{w}}"
@@ -1099,7 +1167,7 @@ def draw_history(win, y, history, width, scroll_offset):
 
 def draw_footer(win, height, width, view_mode):
     views = "1:Main 2:MyJobs 3:Priority 4:FairShare 5:Leaderboard 6:History"
-    keys = f" {views} | q:Quit r:Refresh s:Sort /:User p:Part a/m:All/My +/-:Intv"
+    keys = f" {views} | q:Quit r:Refresh s:Sort /:User p:Part g:GPU a/m:All/My +/-:Intv"
     try:
         safe_addstr(win, height - 1, 0, " " * (width - 1), curses.color_pair(5))
         safe_addstr(win, height - 1, 1, keys[:width - 2], curses.color_pair(5))
@@ -1136,12 +1204,14 @@ def main(stdscr):
     show_all = True
     filter_user = ""
     filter_partition = ""
+    filter_gpu_type = ""
     view_mode = "main"
 
     # Data caches
     partitions = {}
     node_states = {}
-    gpu_info = {}
+    gpu_by_type = {}
+    node_types = {}
     total_gpus = 0
     total_gpu_alloc = 0
     jobs = []
@@ -1161,7 +1231,7 @@ def main(stdscr):
         if now - last_fetch >= REFRESH_INTERVAL:
             partitions = get_partitions()
             node_states = get_node_summary()
-            gpu_info, total_gpus, total_gpu_alloc = get_gpu_info()
+            gpu_by_type, node_types, total_gpus, total_gpu_alloc = get_gpu_info()
             jobs = get_jobs()
             user_summary = get_user_summary(jobs)
             last_fetch = now
@@ -1194,11 +1264,12 @@ def main(stdscr):
         y = draw_header(stdscr, y, width, current_user, VIEW_NAMES.get(view_mode, ""))
 
         if view_mode == "main":
-            y = draw_partition_bars(stdscr, y, partitions, gpu_info, total_gpus, total_gpu_alloc, width)
+            y = draw_partition_bars(stdscr, y, partitions, gpu_by_type, total_gpus, total_gpu_alloc, width)
             y = draw_node_summary(stdscr, y, node_states, width)
             result = draw_job_table(
                 stdscr, y, jobs, width, scroll_offset, sort_key,
-                current_user, show_all, filter_user, filter_partition
+                current_user, show_all, filter_user, filter_partition,
+                filter_gpu_type, node_types
             )
             if isinstance(result, tuple):
                 y, scroll_offset = result
@@ -1206,7 +1277,7 @@ def main(stdscr):
                 y = result
 
         elif view_mode == "users":
-            y = draw_partition_bars(stdscr, y, partitions, gpu_info, total_gpus, total_gpu_alloc, width)
+            y = draw_partition_bars(stdscr, y, partitions, gpu_by_type, total_gpus, total_gpu_alloc, width)
             y = draw_node_summary(stdscr, y, node_states, width)
             y = draw_user_table(stdscr, y, user_summary, width, current_user)
 
@@ -1337,6 +1408,25 @@ def main(stdscr):
                 filter_partition = inp
             else:
                 filter_partition = ""
+            scroll_offset = 0
+        elif ch == ord('g') or ch == ord('G'):
+            curses.curs_set(1)
+            stdscr.nodelay(False)
+            try:
+                safe_addstr(stdscr, height - 1, 0, " " * (width - 1), curses.color_pair(5))
+                avail = ", ".join(sorted(gpu_by_type.keys())) if gpu_by_type else ""
+                prompt = f"GPU type [{avail}]: "
+                safe_addstr(stdscr, height - 1, 1, prompt[:width - 2], curses.color_pair(5))
+                stdscr.refresh()
+                curses.echo()
+                inp = stdscr.getstr(height - 1, min(len(prompt) + 1, width - 2), 20).decode("utf-8").strip()
+                curses.noecho()
+            except curses.error:
+                inp = ""
+            curses.curs_set(0)
+            stdscr.nodelay(True)
+            stdscr.timeout(300)
+            filter_gpu_type = inp if inp else ""
             scroll_offset = 0
         elif ch == curses.KEY_UP:
             scroll_offset = max(0, scroll_offset - 1)
