@@ -495,13 +495,27 @@ def get_user_summary(jobs):
     return dict(users)
 
 
-def get_priority_data():
-    """Whole pending queue with priority factors, ranked. One sprio call."""
+def get_priority_data(jobs=None):
+    """Whole pending queue with priority factors, ranked. One sprio call.
+
+    With PriorityFlags=CALCULATE_RUNNING sprio also lists running jobs, so when
+    the squeue job list is given only PENDING jobs are kept and ranked.
+    """
     raw = run_cmd('sprio -o "%i|%u|%o|%r|%Y|%A|%F|%J|%P|%Q|%N" --noheader', timeout=30)
+    pending_ids = None
+    if jobs is not None:
+        pending_ids = set()
+        for j in jobs:
+            if j["state"] == "PENDING":
+                pending_ids.add(j["id"])
+                pending_ids.add(base_job_id(j["id"]))
     entries = []
     for line in raw.splitlines():
         p = line.split("|")
         if len(p) < 11:
+            continue
+        jid = p[0].strip()
+        if pending_ids is not None and jid not in pending_ids and base_job_id(jid) not in pending_ids:
             continue
         entries.append({
             "id": p[0].strip(), "user": p[1].strip(), "account": p[2].strip(),
@@ -513,6 +527,20 @@ def get_priority_data():
     for rank, e in enumerate(entries, 1):
         e["rank"] = rank
     return entries
+
+
+def rank_pending_only(entries, jobs):
+    """Drop non-pending jobs from sprio output (CALCULATE_RUNNING) and re-rank."""
+    pending = set()
+    for j in jobs:
+        if j["state"] == "PENDING":
+            pending.add(j["id"])
+            pending.add(base_job_id(j["id"]))
+    kept = [e for e in entries if e["id"] in pending or base_job_id(e["id"]) in pending]
+    kept.sort(key=lambda e: e["priority"], reverse=True)
+    for rank, e in enumerate(kept, 1):
+        e["rank"] = rank
+    return kept
 
 
 def _parse_tres(tres_str):
@@ -667,6 +695,7 @@ def collect_snapshot(current_user, history_days=7, leaderboard_limit=50):
         f_hist = ex.submit(get_recent_history, current_user, history_days)
         partitions, nodes, jobs = f_part.result(), f_nodes.result(), f_jobs.result()
         priority, tree, history = f_prio.result(), f_tree.result(), f_hist.result()
+    priority = rank_pending_only(priority, jobs)
 
     node_types, partition_types = nodes["node_types"], nodes["partition_types"]
     user_summary = get_user_summary(jobs)
@@ -1392,7 +1421,7 @@ def main(stdscr, current_user):
             last_fetch = now
         if now - last_slow_fetch >= SLOW_INTERVAL or view_mode not in fetched_slow:
             if view_mode in ("priority", "my_jobs"):
-                priority_data = get_priority_data()
+                priority_data = get_priority_data(jobs)
             if view_mode in ("fairshare", "leaderboard"):
                 fs_tree = get_sshare_tree(current_user)
             if view_mode == "history":
