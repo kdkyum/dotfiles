@@ -326,12 +326,12 @@ def get_nodes():
     """
     raw = run_cmd("scontrol show nodes", timeout=30)
     feature_types = PROFILE.get("untyped_gpu_features", {})
-    by_type = defaultdict(lambda: {"total": 0, "alloc": 0, "nodes": 0, "unavail": 0})
+    by_type = defaultdict(lambda: {"total": 0, "alloc": 0, "free": 0, "nodes": 0, "unavail": 0})
     by_part = defaultdict(lambda: defaultdict(lambda: {"total": 0, "alloc": 0}))
     part_type_sets = defaultdict(set)
     node_types = {}
     node_states = defaultdict(int)
-    totals = {"gpus": 0, "alloc": 0, "unavail": 0, "nodes": 0}
+    totals = {"gpus": 0, "alloc": 0, "free": 0, "unavail": 0, "nodes": 0}
 
     cur = {}
 
@@ -356,6 +356,10 @@ def get_nodes():
             if cur.get("unavail"):
                 e["unavail"] += n
                 totals["unavail"] += n
+            else:
+                # free = schedulable right now: idle GPUs on healthy nodes only
+                e["free"] += max(0, n - a)
+                totals["free"] += max(0, n - a)
             node_types[cur["name"]] = gtype
             for p in cur.get("partitions", []):
                 by_part[p][gtype]["total"] += n
@@ -406,6 +410,7 @@ def get_nodes():
         "node_states": dict(node_states),
         "total_gpus": totals["gpus"],
         "total_gpu_alloc": totals["alloc"],
+        "free_gpus": totals["free"],
         "unavail_gpus": totals["unavail"],
         "n_nodes": totals["nodes"],
     }
@@ -757,17 +762,16 @@ def collect_snapshot(current_user, history_days=7, leaderboard_limit=50):
         "usable": {
             "total": sum(v["total"] for v in usable_rows),
             "allocated": sum(v["alloc"] for v in usable_rows),
-            "free": sum(v["total"] - v["alloc"] for v in usable_rows),
+            "free": sum(v["free"] for v in usable_rows),
             "unavailable": sum(v["unavail"] for v in usable_rows),
         },
         "total": nodes["total_gpus"],
         "allocated": nodes["total_gpu_alloc"],
-        "free": nodes["total_gpus"] - nodes["total_gpu_alloc"],
+        "free": nodes["free_gpus"],  # schedulable now; excludes down/drain/maint nodes
         "unavailable": nodes["unavail_gpus"],
         "usage_pct": round(100.0 * nodes["total_gpu_alloc"] / nodes["total_gpus"], 1) if nodes["total_gpus"] else 0.0,
         "by_type": {
-            t: dict(v, free=v["total"] - v["alloc"],
-                    usage_pct=round(100.0 * v["alloc"] / v["total"], 1) if v["total"] else 0.0)
+            t: dict(v, usage_pct=round(100.0 * v["alloc"] / v["total"], 1) if v["total"] else 0.0)
             for t, v in gpu_by_type.items()
         },
         "by_partition": nodes["gpu_by_partition"],
@@ -920,7 +924,7 @@ def draw_partition_bars(win, y, partitions, nodes, width, usable_types=None):
         safe_addstr(win, y, 0, f" {gtype.upper():>18s}", curses.color_pair(6))
         draw_bar(win, y, label_width, bar_width, g["alloc"] / g["total"] if g["total"] else 0, f"{g['alloc']}/{g['total']}")
         if info_col < width:
-            info = f"{g['nodes']} nodes"
+            info = f"{g['nodes']} nodes, {g['free']} free"
             safe_addstr(win, y, info_col, info, curses.color_pair(7) | curses.A_DIM)
             if g["unavail"] > 0:
                 safe_addstr(win, y, info_col + len(info), f" ({g['unavail']} unavail)", curses.color_pair(3))
