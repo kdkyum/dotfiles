@@ -437,6 +437,11 @@ def get_jobs():
     return jobs
 
 
+def base_job_id(job_id):
+    """'5849387_[2-7]' / '5849387_3' -> '5849387' (sprio reports array jobs by base id)."""
+    return job_id.split("_", 1)[0]
+
+
 def job_gpu_count(job):
     m = re.search(r'(?:gres/)?gpu(?::[A-Za-z_][\w.-]*)?:(\d+)', job.get("gres", ""))
     if not m:
@@ -688,7 +693,7 @@ def collect_snapshot(current_user, history_days=7, leaderboard_limit=50):
     my_jobs = [enrich(j) for j in jobs if j["user"] == current_user]
     prio_by_id = {p["id"]: p for p in priority}
     for j in my_jobs:
-        pr = prio_by_id.get(j["id"])
+        pr = prio_by_id.get(j["id"]) or prio_by_id.get(base_job_id(j["id"]))
         if pr:
             j["queue_rank"] = pr["rank"]
             j["priority_factors"] = {k: pr[k] for k in ("age", "fairshare", "jobsize", "partition", "qos", "nice")}
@@ -1044,8 +1049,10 @@ def draw_my_jobs(win, y, jobs, width, current_user, scroll, nodes, priority_data
     gpus_run = sum(job_gpu_count(j) for j in my_jobs if j["state"] == "RUNNING")
     summary = f" Running: {running} ({gpus_run} GPUs)  Pending: {pending}" + (f"  Other: {other}" if other else "")
     rank_by_id = {p["id"]: p["rank"] for p in priority_data}
+    rank_by_id.update({base_job_id(p["id"]): p["rank"] for p in priority_data if "_" in p["id"]})
     if priority_data and pending:
-        best = min((rank_by_id.get(j["id"]) for j in my_jobs if j["id"] in rank_by_id), default=None)
+        best = min((rank_by_id.get(j["id"], rank_by_id.get(base_job_id(j["id"]))) for j in my_jobs
+                    if j["state"] == "PENDING" and (j["id"] in rank_by_id or base_job_id(j["id"]) in rank_by_id)), default=None)
         if best:
             summary += f"   best queue rank: {best}/{len(priority_data)}"
     safe_addstr(win, y, 2, summary, curses.color_pair(7))
@@ -1070,7 +1077,7 @@ def draw_my_jobs(win, y, jobs, width, current_user, scroll, nodes, priority_data
         n = job_gpu_count(j)
         gtype = job_gpu_type(j, nodes.get("node_types", {}), nodes.get("partition_types", {}))
         gpu_str = f"{n} {gtype}"[:10] if n else "-"
-        rank = rank_by_id.get(j["id"])
+        rank = rank_by_id.get(j["id"]) or rank_by_id.get(base_job_id(j["id"]))
         eta, _ = job_eta(j)
         vals = [j["id"], j["name"], st, j["partition"], j["time"], j["time_limit"], gpu_str,
                 str(rank) if rank else "-", eta[:cols[-1][1]]]
