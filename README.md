@@ -28,10 +28,19 @@ curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/sl
 ```
 
 ```bash
-# slurm-top
+# slurm-top (single file for all clusters: raven, viper, dais, sws-grid)
 curl -fsSL https://raw.githubusercontent.com/kdkyum/dotfiles/master/local/bin/slurm-top \
   -o ~/.local/bin/slurm-top && chmod +x ~/.local/bin/slurm-top
+
+slurm-top          # interactive dashboard (1-6 views, u users, l/t/i on leaderboard)
+slurm-top --json   # one-shot snapshot: GPUs by type/partition, queue, my jobs + ETA,
+                   # priority rank, fairshare (both fair-tree levels), leaderboard, history
+slurm-top --json --compact --days 14 -u someone
 ```
+
+Cluster name, priority weights and usage decay are read from `scontrol show config`;
+per-cluster extras (Viper's untyped MI300A GRES, partition notes) live in `PROFILES`
+at the top of the script. Needs Python >= 3.6.
 
 ```bash
 # tat

@@ -1,216 +1,188 @@
 #!/usr/bin/env python3
-"""slurm-top: An htop-like real-time dashboard for Slurm clusters."""
+"""slurm-top: An htop-like real-time dashboard for Slurm clusters.
 
-import curses
-import subprocess
-import time
+One file for every cluster (raven, viper, dais, sws-grid, ...). Cluster
+specifics are read live from `scontrol show config` (name, priority weights,
+usage decay) plus a small optional per-cluster profile below.
+
+    slurm-top            interactive curses dashboard
+    slurm-top --json     one-shot JSON snapshot (GPUs, queue, my jobs,
+                         priority rank, fairshare, leaderboard, history)
+
+Python 3.6+ (dais still runs 3.6).
+"""
+
+import argparse
+import json
+import math
 import os
-import signal
 import re
+import signal
+import subprocess
+import sys
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
-REFRESH_INTERVAL = 3  # seconds
+REFRESH_INTERVAL = 3   # seconds, fast data (sinfo/scontrol/squeue)
+SLOW_INTERVAL = 15     # seconds, slow data (sprio/sshare/sacct)
+
+# ── Per-cluster profiles (everything else is auto-detected) ──────────────────
+# Keyed by ClusterName from `scontrol show config`.
+#   untyped_gpu_features: node feature -> GPU model, for clusters that expose
+#                         GPUs as plain gres/gpu (Viper's MI300A APUs).
+#   partition_notes:      short usage hints shown next to partition bars.
+PROFILES = {
+    "raven": {
+        "partition_notes": {
+            "gpu": "exclusive full nodes (4x A100)",
+            "gpu1": "shared; 1-2 GPUs",
+            "gpudev": "debug; 15 min",
+            "general": "CPU; full nodes",
+            "small": "CPU; shared nodes",
+            "interactive": "login-like; 2 h",
+            "rvs": "reservations",
+        },
+    },
+    "viper": {
+        "untyped_gpu_features": {"apu": "mi300a"},
+        "partition_notes": {
+            "apu": "exclusive full nodes (2x MI300A)",
+            "apu1": "shared; 1 APU",
+            "apudev": "debug; 15 min",
+            "general": "CPU; full nodes",
+            "small": "CPU; shared nodes",
+            "interactive": "login-like; 2 h",
+            "datatransfer": "I/O; 6 h",
+        },
+    },
+    "dais": {
+        "partition_notes": {
+            "gpu": "exclusive full nodes (8 GPU)",
+            "gpu1": "shared; <4 GPUs; 12 cpu/250G per GPU",
+            "gpudev": "debug; 15 min; 4 GPU; 1 job/user",
+            "small": "CPU only; 6 h",
+            "rvs": "reservations",
+        },
+    },
+    "sws-grid": {
+        "partition_notes": {
+            "spyder": "CPU only",
+        },
+    },
+}
+
+CLUSTER = {
+    "name": os.environ.get("SLURM_CLUSTER_NAME", "slurm"),
+    "w_fairshare": 0, "w_age": 0, "w_jobsize": 0, "w_partition": 0,
+    "w_qos": 0, "w_assoc": 0,
+    "max_age_s": None, "half_life_s": 0, "usage_reset": "NONE",
+    "priority_type": "", "priority_flags": "",
+}
+PROFILE = {}
 
 
-# ── Data Collection ──────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def run_cmd(cmd, timeout=10):
+def run_cmd(cmd, timeout=20):
     try:
         r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
-        return r.stdout.strip()
+                           stderr=subprocess.DEVNULL, universal_newlines=True,
+                           timeout=timeout)
+        return r.stdout
     except Exception:
         return ""
 
 
+def _int(s, default=0):
+    s = (s or "").strip()
+    return int(s) if s.lstrip("-").isdigit() else default
+
+
+def _float(s, default=0.0):
+    try:
+        return float((s or "").strip())
+    except ValueError:
+        return default
+
+
 def parse_time_to_seconds(t):
-    """Parse Slurm time format (D-HH:MM:SS, HH:MM:SS, MM:SS) to seconds."""
-    if not t or t == "UNLIMITED" or t == "INVALID" or t == "Partition_Limit":
+    """Parse Slurm time (D-HH:MM:SS, HH:MM:SS, MM:SS) to seconds; None if n/a."""
+    if not t or t in ("UNLIMITED", "INVALID", "Partition_Limit", "N/A", "NONE"):
         return None
     try:
         days = 0
         if "-" in t:
             d, t = t.split("-", 1)
             days = int(d)
-        parts = t.split(":")
+        parts = [int(p) for p in t.split(":")]
         if len(parts) == 3:
-            return days * 86400 + int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-        elif len(parts) == 2:
-            return days * 86400 + int(parts[0]) * 60 + int(parts[1])
-        elif len(parts) == 1:
-            return days * 86400 + int(parts[0])
-    except (ValueError, IndexError):
+            return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+        if len(parts) == 2:
+            return days * 86400 + parts[0] * 60 + parts[1]
+        if len(parts) == 1:
+            return days * 86400 + parts[0]
+    except ValueError:
         pass
     return None
 
 
 def seconds_to_human(s):
-    """Convert seconds to human-readable string."""
     if s is None or s < 0:
         return "N/A"
-    d = int(s) // 86400
-    h = (int(s) % 86400) // 3600
-    m = (int(s) % 3600) // 60
+    s = int(s)
+    d, h, m = s // 86400, (s % 86400) // 3600, (s % 3600) // 60
     if d > 0:
         return f"{d}d{h:02d}h{m:02d}m"
-    elif h > 0:
+    if h > 0:
         return f"{h}h{m:02d}m"
-    else:
-        return f"{m}m"
+    return f"{m}m"
 
 
 def format_usage(val):
-    """Format large numbers with K/M/G suffix."""
+    val = val or 0
     if val >= 1_000_000_000:
         return f"{val / 1_000_000_000:.1f}G"
-    elif val >= 1_000_000:
+    if val >= 1_000_000:
         return f"{val / 1_000_000:.1f}M"
-    elif val >= 1_000:
+    if val >= 1_000:
         return f"{val / 1_000:.1f}K"
-    return str(val)
+    return str(int(val))
 
 
-def get_partitions():
-    raw = run_cmd('sinfo -o "%P %C %G %D %F %l" --noheader')
-    partitions = {}
-    for line in raw.splitlines():
-        parts = line.split()
-        if len(parts) < 6:
+def fmt_lfs(lfs):
+    if lfs in ("inf", "", None):
+        return "inf"
+    try:
+        v = float(lfs)
+    except (TypeError, ValueError):
+        return str(lfs)[:7]
+    return f"{v:.3f}" if v < 100 else f"{v:.0f}"
+
+
+def lfs_value(lfs):
+    try:
+        return float(lfs)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def parse_slurm_datetime(s):
+    if not s or s in ("N/A", "Unknown", "None"):
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
             continue
-        name = parts[0].rstrip("*")
-        is_default = parts[0].endswith("*")
-        cpus = parts[1].split("/")
-        if len(cpus) != 4:
-            continue
-        alloc, idle, other, total = (int(x) for x in cpus)
-        gres = parts[2]
-        num_nodes = int(parts[3])
-        node_states = parts[4].split("/")
-        if len(node_states) == 4:
-            n_alloc, n_idle, n_other, n_total = (int(x) for x in node_states)
-        else:
-            n_alloc, n_idle, n_other, n_total = 0, 0, 0, num_nodes
-        time_limit = parts[5]
-        has_gpu = "gpu:" in gres
-        gpu_per_node = 0
-        gpu_type = ""
-        if has_gpu:
-            m = re.search(r'gpu:(\w+):(\d+)', gres)
-            if m:
-                gpu_type = m.group(1).upper()
-                gpu_per_node = int(m.group(2))
-            else:
-                m = re.search(r'gpu:(\d+)', gres)
-                if m:
-                    gpu_per_node = int(m.group(1))
-        if name in partitions:
-            # Merge rows: accumulate CPUs/nodes, keep GPU info if present
-            p = partitions[name]
-            p["cpu_alloc"] += alloc
-            p["cpu_idle"] += idle
-            p["cpu_other"] += other
-            p["cpu_total"] += total
-            p["num_nodes"] += num_nodes
-            p["n_alloc"] += n_alloc
-            p["n_idle"] += n_idle
-            p["n_other"] += n_other
-            p["n_total"] += n_total
-            if has_gpu and not p["has_gpu"]:
-                p["has_gpu"] = True
-                p["gpu_per_node"] = gpu_per_node
-                p["gpu_type"] = gpu_type
-        else:
-            partitions[name] = {
-                "name": name, "default": is_default,
-                "cpu_alloc": alloc, "cpu_idle": idle, "cpu_other": other, "cpu_total": total,
-                "has_gpu": has_gpu, "gpu_per_node": gpu_per_node, "gpu_type": gpu_type,
-                "num_nodes": num_nodes,
-                "n_alloc": n_alloc, "n_idle": n_idle, "n_other": n_other, "n_total": n_total,
-                "time_limit": time_limit,
-            }
-    return partitions
-
-
-def get_node_summary():
-    raw = run_cmd('sinfo -o "%T %D" --noheader')
-    states = defaultdict(int)
-    for line in raw.splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            states[parts[0]] += int(parts[1])
-    return dict(states)
-
-
-def get_gpu_info():
-    """Aggregate GPU totals/allocations per GPU type from node-level data.
-
-    Returns (gpu_by_type, node_types, total_gpus, total_alloc) where
-    gpu_by_type = {type: {"total": N, "alloc": N, "nodes": N, "unavail": N}}
-    and node_types = {node_name: gpu_type}.
-    """
-    raw = run_cmd('scontrol show nodes', timeout=15)
-    by_type = defaultdict(lambda: {"total": 0, "alloc": 0, "nodes": 0, "unavail": 0})
-    node_types = {}
-    total_gpus = 0
-    total_alloc = 0
-
-    node_name = ""
-    cfg = {}
-    alloc = {}
-    unavail = False
-
-    def flush():
-        nonlocal total_gpus, total_alloc
-        for t, n in cfg.items():
-            e = by_type[t]
-            e["total"] += n
-            e["nodes"] += 1
-            a = alloc.get(t, 0)
-            e["alloc"] += a
-            if unavail:
-                e["unavail"] += n
-            total_gpus += n
-            total_alloc += a
-
-    for line in raw.splitlines():
-        line = line.strip()
-        if line.startswith("NodeName="):
-            if cfg:
-                flush()
-            node_name = line.split()[0].split("=", 1)[1]
-            cfg = {}
-            alloc = {}
-            unavail = False
-        elif line.startswith("State="):
-            state = line.split()[0].split("=", 1)[1].upper()
-            unavail = any(s in state for s in ("DOWN", "DRAIN", "MAINT", "FAIL"))
-        elif line.startswith("CfgTRES="):
-            for m in re.finditer(r'gres/gpu:([\w.]+)=(\d+)', line):
-                cfg[m.group(1)] = int(m.group(2))
-                node_types[node_name] = m.group(1)
-            if not cfg:
-                m = re.search(r'gres/gpu=(\d+)', line)
-                if m and int(m.group(1)) > 0:
-                    cfg["gpu"] = int(m.group(1))
-                    node_types[node_name] = "gpu"
-        elif line.startswith("AllocTRES="):
-            for m in re.finditer(r'gres/gpu:([\w.]+)=(\d+)', line):
-                alloc[m.group(1)] = int(m.group(2))
-            if not alloc:
-                m = re.search(r'gres/gpu=(\d+)', line)
-                if m:
-                    alloc["gpu"] = int(m.group(1))
-    if cfg:
-        flush()
-
-    return dict(by_type), node_types, total_gpus, total_alloc
+    return None
 
 
 def expand_nodelist(nodelist):
-    """Expand a compact Slurm nodelist like 'daisg[101-103,105]' to node names."""
+    """Expand 'daisg[101-103,105],ravg1001' to a list of node names."""
     nodes = []
-    for m in re.finditer(r'([^,\[]+)(?:\[([^\]]+)\])?,?', nodelist):
+    for m in re.finditer(r'([^,\[]+)(?:\[([^\]]+)\])?,?', nodelist or ""):
         prefix, ranges = m.group(1), m.group(2)
         if not ranges:
             nodes.append(prefix)
@@ -219,8 +191,7 @@ def expand_nodelist(nodelist):
             try:
                 if "-" in r:
                     a, b = r.split("-", 1)
-                    for i in range(int(a), int(b) + 1):
-                        nodes.append(f"{prefix}{i:0{len(a)}d}")
+                    nodes.extend(f"{prefix}{i:0{len(a)}d}" for i in range(int(a), int(b) + 1))
                 else:
                     nodes.append(prefix + r)
             except ValueError:
@@ -228,41 +199,282 @@ def expand_nodelist(nodelist):
     return nodes
 
 
-def job_gpu_type(job, node_types):
-    """Resolve a job's GPU type from its GRES string or its allocated nodes."""
+# ── Cluster config ───────────────────────────────────────────────────────────
+
+def load_cluster_config():
+    global PROFILE
+    raw = run_cmd("scontrol show config")
+    for line in raw.splitlines():
+        if "=" not in line:
+            continue
+        k, v = (s.strip() for s in line.split("=", 1))
+        if k == "ClusterName":
+            CLUSTER["name"] = v
+        elif k == "PriorityType":
+            CLUSTER["priority_type"] = v
+        elif k == "PriorityFlags":
+            CLUSTER["priority_flags"] = v
+        elif k == "PriorityWeightFairShare":
+            CLUSTER["w_fairshare"] = _int(v)
+        elif k == "PriorityWeightAge":
+            CLUSTER["w_age"] = _int(v)
+        elif k == "PriorityWeightJobSize":
+            CLUSTER["w_jobsize"] = _int(v)
+        elif k == "PriorityWeightPartition":
+            CLUSTER["w_partition"] = _int(v)
+        elif k == "PriorityWeightQOS":
+            CLUSTER["w_qos"] = _int(v)
+        elif k == "PriorityWeightAssoc":
+            CLUSTER["w_assoc"] = _int(v)
+        elif k == "PriorityMaxAge":
+            CLUSTER["max_age_s"] = parse_time_to_seconds(v)
+        elif k == "PriorityDecayHalfLife":
+            CLUSTER["half_life_s"] = parse_time_to_seconds(v) or 0
+        elif k == "PriorityUsageResetPeriod":
+            CLUSTER["usage_reset"] = v
+    PROFILE = PROFILES.get(CLUSTER["name"], {})
+    return CLUSTER
+
+
+def priority_summary_line():
+    c = CLUSTER
+    weights = [("fairshare", c["w_fairshare"]), ("qos", c["w_qos"]),
+               ("partition", c["w_partition"]), ("jobsize", c["w_jobsize"]),
+               ("age", c["w_age"])]
+    parts = [f"{k} {format_usage(v)}" for k, v in weights if v]
+    if c["max_age_s"]:
+        parts.append(f"age maxes after {seconds_to_human(c['max_age_s'])}")
+    if c["half_life_s"]:
+        parts.append(f"usage half-life {seconds_to_human(c['half_life_s'])}")
+    elif c["usage_reset"] and c["usage_reset"] != "NONE":
+        parts.append(f"usage reset {c['usage_reset']}")
+    else:
+        parts.append("usage never decays")
+    return "Weights: " + "  ".join(parts)
+
+
+# ── Data collection ──────────────────────────────────────────────────────────
+
+def get_partitions():
+    raw = run_cmd('sinfo -o "%P|%C|%G|%D|%F|%l|%a" --noheader')
+    partitions = {}
+    for line in raw.splitlines():
+        parts = line.split("|")
+        if len(parts) < 6:
+            continue
+        name = parts[0].rstrip("*")
+        is_default = parts[0].endswith("*")
+        cpus = parts[1].split("/")
+        if len(cpus) != 4:
+            continue
+        alloc, idle, other, total = (_int(x) for x in cpus)
+        gres = parts[2]
+        num_nodes = _int(parts[3])
+        ns = parts[4].split("/")
+        n_alloc, n_idle, n_other, n_total = (_int(x) for x in ns) if len(ns) == 4 else (0, 0, 0, num_nodes)
+        time_limit = parts[5]
+        avail = parts[6].strip() if len(parts) > 6 else "up"
+        gpu_type, gpu_per_node = "", 0
+        m = re.search(r'gpu:([\w.-]+):(\d+)', gres) or re.search(r'gpu:(\d+)', gres)
+        if m:
+            if m.lastindex == 2:
+                gpu_type, gpu_per_node = m.group(1), int(m.group(2))
+            else:
+                gpu_per_node = int(m.group(1))
+        has_gpu = gpu_per_node > 0
+        p = partitions.get(name)
+        if p is None:
+            p = partitions[name] = {
+                "name": name, "default": is_default, "avail": avail,
+                "cpu_alloc": 0, "cpu_idle": 0, "cpu_other": 0, "cpu_total": 0,
+                "num_nodes": 0, "n_alloc": 0, "n_idle": 0, "n_other": 0, "n_total": 0,
+                "has_gpu": False, "gpu_types": [], "time_limit": time_limit,
+                "note": PROFILE.get("partition_notes", {}).get(name, ""),
+            }
+        p["cpu_alloc"] += alloc
+        p["cpu_idle"] += idle
+        p["cpu_other"] += other
+        p["cpu_total"] += total
+        p["num_nodes"] += num_nodes
+        p["n_alloc"] += n_alloc
+        p["n_idle"] += n_idle
+        p["n_other"] += n_other
+        p["n_total"] += n_total
+        if has_gpu:
+            p["has_gpu"] = True
+            if gpu_type and gpu_type not in p["gpu_types"]:
+                p["gpu_types"].append(gpu_type)
+    return partitions
+
+
+def get_nodes():
+    """Parse `scontrol show nodes` once; derive everything node-related.
+
+    Returns dict with:
+      gpu_by_type    {type: {total, alloc, nodes, unavail}}
+      gpu_by_partition {partition: {type: {total, alloc}}}
+      node_types     {node: type}
+      partition_types {partition: type|'any'}
+      node_states    {state: count}
+      total_gpus, total_gpu_alloc, unavail_gpus, n_nodes
+    """
+    raw = run_cmd("scontrol show nodes", timeout=30)
+    feature_types = PROFILE.get("untyped_gpu_features", {})
+    by_type = defaultdict(lambda: {"total": 0, "alloc": 0, "nodes": 0, "unavail": 0})
+    by_part = defaultdict(lambda: defaultdict(lambda: {"total": 0, "alloc": 0}))
+    part_type_sets = defaultdict(set)
+    node_types = {}
+    node_states = defaultdict(int)
+    totals = {"gpus": 0, "alloc": 0, "unavail": 0, "nodes": 0}
+
+    cur = {}
+
+    def flush():
+        if not cur:
+            return
+        totals["nodes"] += 1
+        node_states[cur.get("state", "unknown")] += 1
+        cfg, alloc = cur.get("cfg", {}), cur.get("alloc", {})
+        if not cfg:
+            return
+        if set(cfg) == {"gpu"}:
+            gtype = next((t for f, t in feature_types.items() if f in cur.get("features", ())), "gpu")
+            cfg = {gtype: cfg["gpu"]}
+            alloc = {gtype: alloc.get("gpu", 0)}
+        for gtype, n in cfg.items():
+            a = alloc.get(gtype, 0)
+            e = by_type[gtype]
+            e["total"] += n
+            e["alloc"] += a
+            e["nodes"] += 1
+            if cur.get("unavail"):
+                e["unavail"] += n
+                totals["unavail"] += n
+            node_types[cur["name"]] = gtype
+            for p in cur.get("partitions", []):
+                by_part[p][gtype]["total"] += n
+                by_part[p][gtype]["alloc"] += a
+                part_type_sets[p].add(gtype)
+            totals["gpus"] += n
+            totals["alloc"] += a
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("NodeName="):
+            flush()
+            cur = {"name": line.split()[0].split("=", 1)[1], "cfg": {}, "alloc": {}}
+        elif not cur:
+            continue
+        elif line.startswith("State="):
+            state = line.split()[0].split("=", 1)[1]
+            cur["state"] = state.lower()
+            up = state.upper()
+            cur["unavail"] = any(s in up for s in ("DOWN", "DRAIN", "MAINT", "FAIL", "NOT_RESPONDING"))
+        elif line.startswith("AvailableFeatures="):
+            v = line.split("=", 1)[1].split()[0]
+            cur["features"] = set(v.split(",")) if v not in ("(null)", "N/A") else set()
+        elif line.startswith("Partitions="):
+            cur["partitions"] = line.split("=", 1)[1].split()[0].split(",")
+        elif line.startswith("CfgTRES="):
+            for m in re.finditer(r'gres/gpu:([\w.-]+)=(\d+)', line):
+                cur["cfg"][m.group(1)] = int(m.group(2))
+            if not cur["cfg"]:
+                m = re.search(r'gres/gpu=(\d+)', line)
+                if m and int(m.group(1)) > 0:
+                    cur["cfg"]["gpu"] = int(m.group(1))
+        elif line.startswith("AllocTRES="):
+            for m in re.finditer(r'gres/gpu:([\w.-]+)=(\d+)', line):
+                cur["alloc"][m.group(1)] = int(m.group(2))
+            if not cur["alloc"]:
+                m = re.search(r'gres/gpu=(\d+)', line)
+                if m:
+                    cur["alloc"]["gpu"] = int(m.group(1))
+    flush()
+
+    partition_types = {p: (next(iter(t)) if len(t) == 1 else "any") for p, t in part_type_sets.items()}
+    return {
+        "gpu_by_type": {k: dict(v) for k, v in by_type.items()},
+        "gpu_by_partition": {p: {t: dict(v) for t, v in d.items()} for p, d in by_part.items()},
+        "node_types": node_types,
+        "partition_types": partition_types,
+        "node_states": dict(node_states),
+        "total_gpus": totals["gpus"],
+        "total_gpu_alloc": totals["alloc"],
+        "unavail_gpus": totals["unavail"],
+        "n_nodes": totals["nodes"],
+    }
+
+
+def annotate_partitions(partitions, nodes):
+    """Fill partition GPU types/counts from node data (sinfo GRES may be untyped)."""
+    for name, p in partitions.items():
+        by_type = nodes.get("gpu_by_partition", {}).get(name, {})
+        if by_type:
+            p["has_gpu"] = True
+            p["gpu_types"] = sorted(by_type, key=lambda t: -by_type[t]["total"])
+            p["gpu_total"] = sum(v["total"] for v in by_type.values())
+            p["gpu_alloc"] = sum(v["alloc"] for v in by_type.values())
+    return partitions
+
+
+def get_jobs():
+    raw = run_cmd('squeue -o "%i|%P|%j|%u|%T|%M|%D|%C|%b|%R|%V|%l|%S|%a|%Q|%q" --noheader')
+    jobs = []
+    for line in raw.splitlines():
+        p = line.split("|")
+        if len(p) < 13:
+            continue
+        jobs.append({
+            "id": p[0].strip(), "partition": p[1].strip(), "name": p[2].strip(),
+            "user": p[3].strip(), "state": p[4].strip(), "time": p[5].strip(),
+            "nodes": p[6].strip(), "cpus": p[7].strip(), "gres": p[8].strip(),
+            "reason": p[9].strip(), "submit_time": p[10].strip(),
+            "time_limit": p[11].strip(), "start_time": p[12].strip(),
+            "account": p[13].strip() if len(p) > 13 else "",
+            "priority": _int(p[14]) if len(p) > 14 else 0,
+            "qos": p[15].strip() if len(p) > 15 else "",
+        })
+    return jobs
+
+
+def job_gpu_count(job):
+    m = re.search(r'(?:gres/)?gpu(?::[A-Za-z_][\w.-]*)?:(\d+)', job.get("gres", ""))
+    if not m:
+        return 0
+    nodes = _int(job.get("nodes", ""), 1) or 1
+    return int(m.group(1)) * nodes
+
+
+def job_gpu_type(job, node_types, partition_types):
     gres = job.get("gres", "")
-    m = re.search(r'gpu:([A-Za-z_][\w.]*):', gres)
+    m = re.search(r'gpu:([A-Za-z_][\w.-]*):', gres)
     if m:
         return m.group(1)
     if "gpu" not in gres:
         return ""
     if job.get("state") == "RUNNING":
-        for n in expand_nodelist(job.get("reason", "")):
-            t = node_types.get(n)
+        for node in expand_nodelist(job.get("reason", "")):
+            t = node_types.get(node)
             if t:
                 return t
-    return "any"
+    return partition_types.get(job.get("partition", ""), "any")
 
 
-def get_jobs():
-    raw = run_cmd(
-        'squeue -o "%i|%P|%j|%u|%T|%M|%D|%C|%b|%R|%V|%l|%S" --noheader'
-    )
-    jobs = []
-    for line in raw.splitlines():
-        parts = line.split("|")
-        if len(parts) < 13:
-            continue
-        jobs.append({
-            "id": parts[0].strip(), "partition": parts[1].strip(),
-            "name": parts[2].strip(), "user": parts[3].strip(),
-            "state": parts[4].strip(), "time": parts[5].strip(),
-            "nodes": parts[6].strip(), "cpus": parts[7].strip(),
-            "gres": parts[8].strip(), "reason": parts[9].strip(),
-            "submit_time": parts[10].strip(), "time_limit": parts[11].strip(),
-            "start_time": parts[12].strip(),
-        })
-    return jobs
+def job_eta(job):
+    """(label, seconds) — remaining time for running jobs, expected start for pending."""
+    if job["state"] == "RUNNING":
+        el, lim = parse_time_to_seconds(job["time"]), parse_time_to_seconds(job["time_limit"])
+        if el is not None and lim is not None:
+            return f"{seconds_to_human(lim - el)} left", lim - el
+        return "-", None
+    if job["state"] == "PENDING":
+        st = parse_slurm_datetime(job.get("start_time", ""))
+        if st:
+            delta = (st - datetime.now()).total_seconds()
+            return (f"in {seconds_to_human(delta)}" if delta > 0 else "starting..."), max(0, delta)
+        reason = job.get("reason", "")
+        return (reason if reason and reason != "None" else "waiting"), None
+    return "", None
 
 
 def get_user_summary(jobs):
@@ -271,162 +483,286 @@ def get_user_summary(jobs):
         u = users[j["user"]]
         if j["state"] == "RUNNING":
             u["running"] += 1
-            u["cpus"] += int(j["cpus"]) if j["cpus"].isdigit() else 0
-            m = re.search(r'gpu[:\w]*?:(\d+)', j["gres"])
-            nodes = int(j["nodes"]) if j["nodes"].strip().isdigit() else 1
-            if m:
-                u["gpus"] += int(m.group(1)) * nodes
+            u["cpus"] += _int(j["cpus"])
+            u["gpus"] += job_gpu_count(j)
         else:
             u["pending"] += 1
     return dict(users)
 
 
-def get_priority_data(current_user):
-    raw = run_cmd(f'sprio -u {current_user} -o "%i|%u|%Y|%A|%F|%P|%Q|%N" --noheader')
+def get_priority_data():
+    """Whole pending queue with priority factors, ranked. One sprio call."""
+    raw = run_cmd('sprio -o "%i|%u|%o|%r|%Y|%A|%F|%J|%P|%Q|%N" --noheader', timeout=30)
     entries = []
     for line in raw.splitlines():
-        parts = line.split("|")
-        if len(parts) < 8:
+        p = line.split("|")
+        if len(p) < 11:
             continue
-        try:
-            entries.append({
-                "id": parts[0].strip(), "user": parts[1].strip(),
-                "priority": int(parts[2].strip()) if parts[2].strip().lstrip('-').isdigit() else 0,
-                "age": int(parts[3].strip()) if parts[3].strip().lstrip('-').isdigit() else 0,
-                "fairshare": int(parts[4].strip()) if parts[4].strip().lstrip('-').isdigit() else 0,
-                "partition": int(parts[5].strip()) if parts[5].strip().lstrip('-').isdigit() else 0,
-                "qos": int(parts[6].strip()) if parts[6].strip().lstrip('-').isdigit() else 0,
-                "nice": int(parts[7].strip()) if parts[7].strip().lstrip('-').isdigit() else 0,
-            })
-        except (ValueError, IndexError):
-            continue
+        entries.append({
+            "id": p[0].strip(), "user": p[1].strip(), "account": p[2].strip(),
+            "partition_name": p[3].strip(), "priority": _int(p[4]),
+            "age": _int(p[5]), "fairshare": _int(p[6]), "jobsize": _int(p[7]),
+            "partition": _int(p[8]), "qos": _int(p[9]), "nice": _int(p[10]),
+        })
+    entries.sort(key=lambda e: e["priority"], reverse=True)
+    for rank, e in enumerate(entries, 1):
+        e["rank"] = rank
     return entries
 
 
-def get_fairshare_data(current_user):
-    """Get fairshare data for user's accounts."""
-    accounts_raw = run_cmd(f'sacctmgr show assoc where user={current_user} format=Account --noheader --parsable2')
-    accounts = [a.strip() for a in accounts_raw.splitlines() if a.strip()]
-
-    result = {"accounts": [], "gpu_account": None}
-    for acc in accounts:
-        raw = run_cmd(f'sshare -a -l --parsable2 2>/dev/null | grep "{acc}|{current_user}|"')
-        for line in raw.splitlines():
-            parts = line.strip().split("|")
-            if len(parts) < 9:
-                continue
-            account = parts[0].strip()
-            user = parts[1].strip()
-            if user != current_user:
-                continue
-            try:
-                entry = {
-                    "account": account, "user": user,
-                    "raw_shares": int(parts[2]) if parts[2].strip().isdigit() else 0,
-                    "norm_shares": float(parts[3]) if parts[3].strip() else 0,
-                    "raw_usage": int(parts[4]) if parts[4].strip().isdigit() else 0,
-                    "norm_usage": float(parts[5]) if parts[5].strip() else 0,
-                    "effectv_usage": float(parts[6]) if parts[6].strip() else 0,
-                    "fairshare": float(parts[7]) if parts[7].strip() else 0,
-                    "level_fs": parts[8].strip(),
-                }
-                result["accounts"].append(entry)
-                if "apu" in account or "gpu" in account:
-                    result["gpu_account"] = account
-            except (ValueError, IndexError):
-                continue
-
-    # Get group-level data for the GPU account
-    if result["gpu_account"]:
-        acc = result["gpu_account"]
-        raw = run_cmd(f'sshare -a -l --parsable2 2>/dev/null | grep "{acc}"')
-        group_entry = None
-        for line in raw.splitlines():
-            parts = line.strip().split("|")
-            if len(parts) < 9:
-                continue
-            account = parts[0].strip()
-            user = parts[1].strip()
-            if account == acc and not user:
-                try:
-                    group_entry = {
-                        "account": account,
-                        "raw_usage": int(parts[4]) if parts[4].strip().isdigit() else 0,
-                        "effectv_usage": float(parts[6]) if parts[6].strip() else 0,
-                    }
-                except (ValueError, IndexError):
-                    pass
-                break
-        result["group_data"] = group_entry
-
-    return result
+def _parse_tres(tres_str):
+    """'cpu=..,gres/gpu=..,gres/gpu:h200=..' -> {'cpu': n, 'gpu': n, 'h200': n}."""
+    out = {}
+    for m in re.finditer(r'(cpu|gres/gpu(?::[\w.-]+)?)=(\d+)', tres_str or ""):
+        key = m.group(1).replace("gres/gpu:", "").replace("gres/gpu", "gpu")
+        out[key] = int(m.group(2))
+    return out
 
 
-def get_group_leaderboard(gpu_account):
-    """Get all users in the GPU account for leaderboard."""
-    if not gpu_account:
-        return []
-    raw = run_cmd(f'sshare -a -l --parsable2 2>/dev/null | grep "{gpu_account}"')
-    users = []
+def get_sshare_tree(current_user):
+    """Parse the whole fairshare tree with ONE `sshare -a -l` call.
+
+    Fair-tree ranking is by LevelFS at each level: accounts compete under
+    root, users compete within their account.
+    Returns {"root": row|None, "accounts": [...], "users": {acct: [...]},
+             "my_accounts": [...my user rows...]}.
+    """
+    raw = run_cmd("sshare -a -l --parsable2", timeout=60)
+    root = None
+    accounts = []
+    users = defaultdict(list)
+    my_accounts = []
     for line in raw.splitlines():
-        parts = line.strip().split("|")
-        if len(parts) < 11:
+        p = line.split("|")
+        if len(p) < 9 or p[0].strip() == "Account":
             continue
-        account = parts[0].strip()
-        user = parts[1].strip()
-        if account != gpu_account or not user:
+        account, user = p[0].strip(), p[1].strip()
+        entry = {
+            "account": account, "user": user,
+            "raw_shares": _int(p[2]), "norm_shares": _float(p[3]),
+            "raw_usage": _int(p[4]), "norm_usage": _float(p[5]),
+            "effectv_usage": _float(p[6]), "fairshare": _float(p[7]),
+            "level_fs": p[8].strip(),
+            "tres_run_mins": _parse_tres(p[10] if len(p) > 10 else ""),
+        }
+        if account == "root" and not user:
+            root = entry
+        elif account == "root":
             continue
-        try:
-            tres_str = parts[10] if len(parts) > 10 else ""
-            gpu_mins = 0
-            m = re.search(r'gres/gpu=(\d+)', tres_str)
-            if m:
-                gpu_mins = int(m.group(1))
-            users.append({
-                "user": user,
-                "raw_usage": int(parts[4]) if parts[4].strip().isdigit() else 0,
-                "norm_shares": float(parts[3]) if parts[3].strip() else 0,
-                "effectv_usage": float(parts[6]) if parts[6].strip() else 0,
-                "fairshare": float(parts[7]) if parts[7].strip() else 0,
-                "level_fs": parts[8].strip(),
-                "gpu_mins": gpu_mins,
-            })
-        except (ValueError, IndexError):
-            continue
-    users.sort(key=lambda x: x["raw_usage"], reverse=True)
-    return users
+        elif not user:
+            accounts.append(entry)
+        else:
+            users[account].append(entry)
+            if user == current_user:
+                my_accounts.append(entry)
+
+    def key(e):
+        return (lfs_value(e["level_fs"]), -e["raw_usage"])
+
+    accounts.sort(key=key, reverse=True)
+    for rank, a in enumerate(accounts, 1):
+        a["rank"] = rank
+    for lst in users.values():
+        lst.sort(key=key, reverse=True)
+        for rank, u in enumerate(lst, 1):
+            u["rank"] = rank
+    return {"root": root, "accounts": accounts, "users": dict(users), "my_accounts": my_accounts}
 
 
-def get_recent_history(current_user):
-    """Get recent job history from sacct."""
-    start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+def hours_to_fair(level_fs):
+    """Hours of zero usage until LevelFS reaches 1.0, given the decay half-life.
+
+    Only meaningful when usage decays (PriorityDecayHalfLife > 0). Ignores
+    other users' usage also decaying, so it is an optimistic estimate.
+    """
+    hl = CLUSTER.get("half_life_s") or 0
+    if hl <= 0:
+        return None
+    lfs = lfs_value(level_fs)
+    if lfs >= 1.0 or lfs <= 0:
+        return 0.0
+    return math.log2(1.0 / lfs) * hl / 3600.0
+
+
+def fairshare_summary(tree, current_user):
+    """Per account I belong to: my row, the account row, ranks, members."""
+    out = []
+    acct_by_name = {a["account"]: a for a in tree.get("accounts", [])}
+    n_accts = len(tree.get("accounts", []))
+    root_usage = (tree.get("root") or {}).get("raw_usage", 0)
+    for me in tree.get("my_accounts", []):
+        acct = acct_by_name.get(me["account"])
+        members = tree.get("users", {}).get(me["account"], [])
+        active = [u for u in members if u["raw_usage"] > 0]
+        acct_usage = acct["raw_usage"] if acct else sum(u["raw_usage"] for u in members)
+        top = max(active, key=lambda u: u["raw_usage"]) if active else None
+        out.append({
+            "account": me["account"],
+            "me": me,
+            "account_row": acct,
+            "n_accounts": n_accts,
+            "n_members": len(members),
+            "n_active_members": len(active),
+            "account_usage": acct_usage,
+            "cluster_usage": root_usage,
+            "my_share_of_account": me["raw_usage"] / acct_usage if acct_usage else 0.0,
+            "fair_share_of_account": 1.0 / len(members) if members else 0.0,
+            "account_share_of_cluster": (acct["raw_usage"] / root_usage) if (acct and root_usage) else 0.0,
+            "account_usage_vs_share": (acct["norm_usage"] / acct["norm_shares"]) if (acct and acct["norm_shares"] > 0) else None,
+            "hours_to_fair_me": hours_to_fair(me["level_fs"]),
+            "hours_to_fair_account": hours_to_fair(acct["level_fs"]) if acct else None,
+            "priority_contribution": int(me["fairshare"] * CLUSTER["w_fairshare"]),
+            "heaviest_member": {"user": top["user"], "share": top["raw_usage"] / acct_usage if acct_usage else 0} if top else None,
+        })
+    return out
+
+
+def get_recent_history(current_user, days=7):
+    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     raw = run_cmd(
         f'sacct -u {current_user} --starttime={start} -X '
-        f'-o JobID,JobName%40,State%20,ExitCode,Elapsed,Partition,AllocTRES%60 '
-        f'--parsable2 --noheader'
-    )
+        f'-o JobID,JobName%60,State%24,ExitCode,Elapsed,Partition,AllocTRES%80,Start,End,NodeList%40 '
+        f'--parsable2 --noheader', timeout=60)
     jobs = []
     for line in raw.splitlines():
-        parts = line.split("|")
-        if len(parts) < 7:
+        p = line.split("|")
+        if len(p) < 7:
             continue
-        state = parts[2].strip().split()[0]  # strip "by XXXX" from CANCELLED
-        gres_str = parts[6] if len(parts) > 6 else ""
-        gpus = 0
-        m = re.search(r'gres/gpu=(\d+)', gres_str)
-        if m:
-            gpus = int(m.group(1))
+        state = p[2].strip().split()[0] if p[2].strip() else ""
+        tres = _parse_tres(p[6])
+        gtype = next((k for k in tres if k not in ("cpu", "gpu")), "")
         jobs.append({
-            "id": parts[0].strip(), "name": parts[1].strip(),
-            "state": state, "exit_code": parts[3].strip(),
-            "elapsed": parts[4].strip(), "partition": parts[5].strip(),
-            "gpus": gpus,
+            "id": p[0].strip(), "name": p[1].strip(), "state": state,
+            "exit_code": p[3].strip(), "elapsed": p[4].strip(),
+            "partition": p[5].strip(), "gpus": tres.get("gpu", 0),
+            "gpu_type": gtype, "cpus": tres.get("cpu", 0),
+            "start": p[7].strip() if len(p) > 7 else "",
+            "end": p[8].strip() if len(p) > 8 else "",
+            "nodelist": p[9].strip() if len(p) > 9 else "",
         })
-    # Return last 20 (most recent at bottom of sacct output)
-    return jobs[-20:]
+    return jobs
 
 
-# ── Drawing Helpers ──────────────────────────────────────────────────────────
+def fetch_fast():
+    """sinfo + scontrol + squeue in parallel."""
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        fp, fn, fj = ex.submit(get_partitions), ex.submit(get_nodes), ex.submit(get_jobs)
+        return fp.result(), fn.result(), fj.result()
+
+
+# ── JSON snapshot ────────────────────────────────────────────────────────────
+
+def collect_snapshot(current_user, history_days=7, leaderboard_limit=50):
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        f_part = ex.submit(get_partitions)
+        f_nodes = ex.submit(get_nodes)
+        f_jobs = ex.submit(get_jobs)
+        f_prio = ex.submit(get_priority_data)
+        f_tree = ex.submit(get_sshare_tree, current_user)
+        f_hist = ex.submit(get_recent_history, current_user, history_days)
+        partitions, nodes, jobs = f_part.result(), f_nodes.result(), f_jobs.result()
+        priority, tree, history = f_prio.result(), f_tree.result(), f_hist.result()
+
+    node_types, partition_types = nodes["node_types"], nodes["partition_types"]
+    user_summary = get_user_summary(jobs)
+    annotate_partitions(partitions, nodes)
+
+    def enrich(j):
+        label, secs = job_eta(j)
+        out = dict(j)
+        out["gpu_count"] = job_gpu_count(j)
+        out["gpu_type"] = job_gpu_type(j, node_types, partition_types)
+        out["eta"] = label
+        out["eta_seconds"] = secs
+        if j["state"] == "RUNNING":
+            out["nodelist"] = j["reason"]
+            out["reason"] = ""
+        return out
+
+    if len(nodes["gpu_by_type"]) == 1:
+        only_type = next(iter(nodes["gpu_by_type"]))
+        for h in history:
+            if h["gpus"] and not h["gpu_type"]:
+                h["gpu_type"] = only_type
+
+    my_jobs = [enrich(j) for j in jobs if j["user"] == current_user]
+    prio_by_id = {p["id"]: p for p in priority}
+    for j in my_jobs:
+        pr = prio_by_id.get(j["id"])
+        if pr:
+            j["queue_rank"] = pr["rank"]
+            j["priority_factors"] = {k: pr[k] for k in ("age", "fairshare", "jobsize", "partition", "qos", "nice")}
+
+    my_prio = [p for p in priority if p["user"] == current_user]
+    running = [j for j in jobs if j["state"] == "RUNNING"]
+    pending = [j for j in jobs if j["state"] == "PENDING"]
+
+    gpu_by_type = nodes["gpu_by_type"]
+    gpus = {
+        "total": nodes["total_gpus"],
+        "allocated": nodes["total_gpu_alloc"],
+        "free": nodes["total_gpus"] - nodes["total_gpu_alloc"],
+        "unavailable": nodes["unavail_gpus"],
+        "usage_pct": round(100.0 * nodes["total_gpu_alloc"] / nodes["total_gpus"], 1) if nodes["total_gpus"] else 0.0,
+        "by_type": {
+            t: dict(v, free=v["total"] - v["alloc"],
+                    usage_pct=round(100.0 * v["alloc"] / v["total"], 1) if v["total"] else 0.0)
+            for t, v in gpu_by_type.items()
+        },
+        "by_partition": nodes["gpu_by_partition"],
+        "pending_requests": sum(job_gpu_count(j) for j in pending),
+        "my_running": sum(j["gpu_count"] for j in my_jobs if j["state"] == "RUNNING"),
+        "my_pending": sum(j["gpu_count"] for j in my_jobs if j["state"] == "PENDING"),
+    }
+
+    top_users = sorted(user_summary.items(), key=lambda kv: (kv[1]["gpus"], kv[1]["running"]), reverse=True)
+    my_accounts = {a["account"] for a in fairshare_summary(tree, current_user)}
+    lb_accounts = tree["accounts"][:leaderboard_limit]
+    lb_accounts += [a for a in tree["accounts"][leaderboard_limit:] if a["account"] in my_accounts]
+
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "cluster": dict(CLUSTER, user=current_user, hostname=os.uname().nodename,
+                        priority_summary=priority_summary_line()),
+        "gpus": gpus,
+        "partitions": sorted(partitions.values(), key=lambda p: (not p["default"], not p["has_gpu"], p["name"])),
+        "nodes": {"total": nodes["n_nodes"], "states": nodes["node_states"]},
+        "queue": {
+            "running": len(running), "pending": len(pending),
+            "other": len(jobs) - len(running) - len(pending), "total": len(jobs),
+            "users_active": len(user_summary),
+            "top_users": [dict(stats, user=u) for u, stats in top_users[:15]],
+        },
+        "my_jobs": {
+            "running": sum(1 for j in my_jobs if j["state"] == "RUNNING"),
+            "pending": sum(1 for j in my_jobs if j["state"] == "PENDING"),
+            "total": len(my_jobs),
+            "jobs": sorted(my_jobs, key=lambda j: (j["state"] != "RUNNING", j["state"] != "PENDING", j["id"])),
+        },
+        "priority": {
+            "queue_size": len(priority),
+            "my_best_rank": min((p["rank"] for p in my_prio), default=None),
+            "my_jobs": my_prio,
+            "top_of_queue": priority[:5],
+            "weights": {k: CLUSTER[k] for k in ("w_fairshare", "w_age", "w_jobsize", "w_partition", "w_qos")},
+        },
+        "fairshare": {
+            "accounts": fairshare_summary(tree, current_user),
+            "half_life_seconds": CLUSTER["half_life_s"],
+            "usage_reset": CLUSTER["usage_reset"],
+        },
+        "leaderboard": {
+            "accounts": lb_accounts,
+            "members": {a: tree["users"].get(a, []) for a in sorted(my_accounts)},
+        },
+        "history": {"days": history_days, "jobs": history},
+    }
+
+
+# ── Curses UI ────────────────────────────────────────────────────────────────
+
+import curses  # noqa: E402  (after data code so --json works without a TTY)
+
 
 def init_colors():
     curses.start_color()
@@ -438,15 +774,12 @@ def init_colors():
     curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
     curses.init_pair(6, curses.COLOR_MAGENTA, -1)
     curses.init_pair(7, curses.COLOR_WHITE, -1)
-    curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_GREEN)
-    curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-    curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_RED)
     curses.init_pair(11, curses.COLOR_BLACK, curses.COLOR_CYAN)
 
 
 def safe_addstr(win, y, x, s, attr=0):
     max_y, max_x = win.getmaxyx()
-    if y >= max_y or y < 0:
+    if y >= max_y or y < 0 or x >= max_x - 1:
         return
     s = s[:max(0, max_x - x - 1)]
     try:
@@ -455,49 +788,37 @@ def safe_addstr(win, y, x, s, attr=0):
         pass
 
 
-def draw_bar(win, y, x, width, fraction, label, color_pair=1, use_filled=True):
+def draw_bar(win, y, x, width, fraction, label):
     max_y, max_x = win.getmaxyx()
     if y >= max_y - 1 or x + width > max_x:
         return
     fraction = max(0.0, min(1.0, fraction))
     filled = int(fraction * (width - 2))
-    empty = (width - 2) - filled
-    if fraction < 0.5:
-        c = curses.color_pair(1) | curses.A_BOLD
-    elif fraction < 0.8:
-        c = curses.color_pair(2) | curses.A_BOLD
-    else:
-        c = curses.color_pair(3) | curses.A_BOLD
+    c = curses.color_pair(1 if fraction < 0.5 else 2 if fraction < 0.8 else 3) | curses.A_BOLD
     try:
         win.addstr(y, x, "[", curses.color_pair(7))
         if filled > 0:
             win.addstr(y, x + 1, "|" * filled, c)
-        if empty > 0:
-            win.addstr(y, x + 1 + filled, " " * empty)
         win.addstr(y, x + width - 1, "]", curses.color_pair(7))
-        pct_str = f" {fraction*100:.0f}%"
-        label_pos = x + width + 1
-        if label_pos + len(pct_str) + len(label) < max_x:
-            win.addstr(y, label_pos, label, curses.color_pair(7) | curses.A_DIM)
-            win.addstr(y, label_pos + len(label), pct_str, curses.color_pair(7))
+        pct = f" {fraction * 100:.0f}%"
+        pos = x + width + 1
+        if pos + len(pct) + len(label) < max_x:
+            win.addstr(y, pos, label, curses.color_pair(7) | curses.A_DIM)
+            win.addstr(y, pos + len(label), pct, curses.color_pair(7))
     except curses.error:
         pass
 
 
 def draw_colored_bar(win, y, x, width, fraction, color_pair):
-    """Draw a bar with a specific color (for fairshare etc.)."""
     max_y, max_x = win.getmaxyx()
     if y >= max_y - 1 or x + width > max_x:
         return
     fraction = max(0.0, min(1.0, fraction))
     filled = int(fraction * (width - 2))
-    empty = (width - 2) - filled
     try:
         win.addstr(y, x, "[", curses.color_pair(7))
         if filled > 0:
             win.addstr(y, x + 1, "|" * filled, curses.color_pair(color_pair) | curses.A_BOLD)
-        if empty > 0:
-            win.addstr(y, x + 1 + filled, " " * empty)
         win.addstr(y, x + width - 1, "]", curses.color_pair(7))
     except curses.error:
         pass
@@ -506,82 +827,63 @@ def draw_colored_bar(win, y, x, width, fraction, color_pair):
 def draw_header(win, y, width, current_user, view_name):
     ts = time.strftime("%H:%M:%S")
     title = " SLURM-TOP "
-    left = f" {current_user}@slurm"
+    left = f" {current_user}@{CLUSTER['name']}"
     right = f"{view_name} | Refresh: {REFRESH_INTERVAL}s | {ts} "
-    try:
-        win.attron(curses.color_pair(5) | curses.A_BOLD)
-        safe_addstr(win, y, 0, " " * (width - 1), curses.color_pair(5))
-        safe_addstr(win, y, 1, left, curses.color_pair(5) | curses.A_BOLD)
-        mid = (width - len(title)) // 2
-        safe_addstr(win, y, max(0, mid), title, curses.color_pair(5) | curses.A_BOLD)
-        rpos = width - len(right) - 1
-        if rpos > 0:
-            safe_addstr(win, y, rpos, right, curses.color_pair(5))
-        win.attroff(curses.color_pair(5) | curses.A_BOLD)
-    except curses.error:
-        pass
+    safe_addstr(win, y, 0, " " * (width - 1), curses.color_pair(5))
+    safe_addstr(win, y, 1, left, curses.color_pair(5) | curses.A_BOLD)
+    safe_addstr(win, y, max(0, (width - len(title)) // 2), title, curses.color_pair(5) | curses.A_BOLD)
+    if width - len(right) - 1 > 0:
+        safe_addstr(win, y, width - len(right) - 1, right, curses.color_pair(5))
     return y + 1
 
 
-def draw_partition_bars(win, y, partitions, gpu_by_type, total_gpus, total_gpu_alloc, width):
-    bar_width = min(50, width - 40)
-    if bar_width < 10:
-        bar_width = 10
-    label_width = 20  # fixed column where bars start
-    info_col = label_width + bar_width + 22  # fixed column for NODES/LIMIT
+def draw_partition_bars(win, y, partitions, nodes, width):
+    bar_width = max(10, min(50, width - 40))
+    label_width = 20
+    info_col = label_width + bar_width + 22
+    gpu_by_type = nodes.get("gpu_by_type", {})
+    total_gpus, total_alloc = nodes.get("total_gpus", 0), nodes.get("total_gpu_alloc", 0)
 
-    # ── GPUs by type ──
     safe_addstr(win, y, 1, "GPUs BY TYPE", curses.color_pair(4) | curses.A_BOLD)
     if info_col + 12 < width:
         safe_addstr(win, y, info_col, "NODES", curses.color_pair(7) | curses.A_DIM)
     y += 1
-
     if total_gpus > 0:
-        gpu_frac = total_gpu_alloc / total_gpus
-        label = f" {'Total':>14s} GPU"
-        safe_addstr(win, y, 0, label, curses.color_pair(6) | curses.A_BOLD)
-        draw_bar(win, y, label_width, bar_width, gpu_frac, f"{total_gpu_alloc}/{total_gpus}")
+        safe_addstr(win, y, 0, f" {'Total':>14s} GPU", curses.color_pair(6) | curses.A_BOLD)
+        draw_bar(win, y, label_width, bar_width, total_alloc / total_gpus, f"{total_alloc}/{total_gpus}")
         y += 1
-
     for gtype in sorted(gpu_by_type, key=lambda t: gpu_by_type[t]["total"], reverse=True):
         if y >= win.getmaxyx()[0] - 2:
             break
         g = gpu_by_type[gtype]
-        frac = g["alloc"] / g["total"] if g["total"] > 0 else 0
-        name_str = f" {gtype.upper():>18s}"
-        safe_addstr(win, y, 0, name_str, curses.color_pair(6))
-        draw_bar(win, y, label_width, bar_width, frac, f"{g['alloc']}/{g['total']}")
+        safe_addstr(win, y, 0, f" {gtype.upper():>18s}", curses.color_pair(6))
+        draw_bar(win, y, label_width, bar_width, g["alloc"] / g["total"] if g["total"] else 0, f"{g['alloc']}/{g['total']}")
         if info_col < width:
             info = f"{g['nodes']} nodes"
             safe_addstr(win, y, info_col, info, curses.color_pair(7) | curses.A_DIM)
             if g["unavail"] > 0:
-                safe_addstr(win, y, info_col + len(info), f" ({g['unavail']} unavail)",
-                            curses.color_pair(3))
+                safe_addstr(win, y, info_col + len(info), f" ({g['unavail']} unavail)", curses.color_pair(3))
+        y += 1
+    if not gpu_by_type:
+        safe_addstr(win, y, 2, "No GPUs in this cluster.", curses.color_pair(7) | curses.A_DIM)
         y += 1
     y += 1
 
-    # ── Partition CPUs ──
     safe_addstr(win, y, 1, "PARTITIONS (CPU)", curses.color_pair(4) | curses.A_BOLD)
     if info_col + 12 < width:
         safe_addstr(win, y, info_col, "LIMIT", curses.color_pair(7) | curses.A_DIM)
     y += 1
-
-    sorted_parts = sorted(
-        partitions.values(),
-        key=lambda p: (not p["default"], not p["has_gpu"], p["name"])
-    )
-    for p in sorted_parts:
+    for p in sorted(partitions.values(), key=lambda p: (not p["default"], not p["has_gpu"], p["name"])):
         if y >= win.getmaxyx()[0] - 2:
             break
-        total = p["cpu_total"]
-        alloc = p["cpu_alloc"]
-        frac = alloc / total if total > 0 else 0
-        tl = p.get("time_limit", "")
-        name_str = f" {p['name']:>14s} CPU"
-        safe_addstr(win, y, 0, name_str, curses.color_pair(4))
-        draw_bar(win, y, label_width, bar_width, frac, f"{alloc}/{total}")
-        if tl and info_col < width:
-            safe_addstr(win, y, info_col, tl, curses.color_pair(7) | curses.A_DIM)
+        total, alloc = p["cpu_total"], p["cpu_alloc"]
+        safe_addstr(win, y, 0, f" {p['name']:>14s} CPU", curses.color_pair(4))
+        draw_bar(win, y, label_width, bar_width, alloc / total if total else 0, f"{alloc}/{total}")
+        if info_col < width:
+            safe_addstr(win, y, info_col, f"{p.get('time_limit', ''):<11}", curses.color_pair(7) | curses.A_DIM)
+            note = p.get("note") or (", ".join(p["gpu_types"]) if p["gpu_types"] else "")
+            if note:
+                safe_addstr(win, y, info_col + 12, note, curses.color_pair(7) | curses.A_DIM)
         y += 1
     return y + 1
 
@@ -589,35 +891,28 @@ def draw_partition_bars(win, y, partitions, gpu_by_type, total_gpus, total_gpu_a
 def draw_node_summary(win, y, node_states, width):
     safe_addstr(win, y, 1, "NODES", curses.color_pair(4) | curses.A_BOLD)
     y += 1
-    groups = {
-        "allocated": 0, "mixed": 0, "idle": 0, "completing": 0,
-        "drained": 0, "down": 0, "planned": 0, "other": 0
-    }
+    groups = {"allocated": 0, "mixed": 0, "idle": 0, "completing": 0,
+              "drained": 0, "down": 0, "planned": 0, "other": 0}
     total = 0
     for state, count in node_states.items():
         total += count
         s = state.lower().rstrip("*~#$+")
-        matched = False
         for g in groups:
             if g in s:
                 groups[g] += count
-                matched = True
                 break
-        if not matched:
+        else:
             groups["other"] += count
-    state_colors = {
-        "allocated": curses.color_pair(1) | curses.A_BOLD,
-        "mixed": curses.color_pair(2) | curses.A_BOLD,
-        "idle": curses.color_pair(7),
-        "completing": curses.color_pair(2),
-        "drained": curses.color_pair(3),
-        "down": curses.color_pair(3) | curses.A_BOLD,
-        "planned": curses.color_pair(6),
-        "other": curses.color_pair(7) | curses.A_DIM,
+    colors = {
+        "allocated": curses.color_pair(1) | curses.A_BOLD, "mixed": curses.color_pair(2) | curses.A_BOLD,
+        "idle": curses.color_pair(7), "completing": curses.color_pair(2),
+        "drained": curses.color_pair(3), "down": curses.color_pair(3) | curses.A_BOLD,
+        "planned": curses.color_pair(6), "other": curses.color_pair(7) | curses.A_DIM,
     }
     col = 2
-    safe_addstr(win, y, col, f"Total: {total}  ", curses.color_pair(7) | curses.A_BOLD)
-    col += len(f"Total: {total}  ")
+    s = f"Total: {total}  "
+    safe_addstr(win, y, col, s, curses.color_pair(7) | curses.A_BOLD)
+    col += len(s)
     for state, count in groups.items():
         if count == 0:
             continue
@@ -625,17 +920,28 @@ def draw_node_summary(win, y, node_states, width):
         if col + len(s) >= width - 1:
             y += 1
             col = 2
-            if y >= win.getmaxyx()[0] - 2:
-                break
-        safe_addstr(win, y, col, s, state_colors.get(state, curses.color_pair(7)))
+        safe_addstr(win, y, col, s, colors[state])
         col += len(s)
     return y + 2
 
 
-def draw_job_table(win, y, jobs, width, scroll_offset, sort_key, current_user,
-                   show_all, filter_user, filter_partition, filter_gpu_type, node_types):
+def _table_header(win, y, cols, width):
+    hdr = "".join(f" {name:<{w}}" for name, w in cols)
+    safe_addstr(win, y, 1, hdr[:width - 2], curses.color_pair(11) | curses.A_BOLD)
+    return y + 1
+
+
+def _scroll_indicator(win, y, start, visible, n):
+    if n > visible:
+        max_y = win.getmaxyx()[0]
+        safe_addstr(win, min(y, max_y - 1), 1, f" [{start + 1}-{min(start + visible, n)}/{n}]",
+                    curses.color_pair(7) | curses.A_DIM)
+
+
+def draw_job_table(win, y, jobs, width, scroll, sort_key, current_user, show_all,
+                   filter_user, filter_partition, filter_gpu_type, nodes):
     max_y = win.getmaxyx()[0]
-    title = "JOBS"
+    node_types, partition_types = nodes.get("node_types", {}), nodes.get("partition_types", {})
     filters = []
     if filter_user:
         filters.append(f"user: {filter_user}")
@@ -645,808 +951,581 @@ def draw_job_table(win, y, jobs, width, scroll_offset, sort_key, current_user,
         filters.append(f"partition: {filter_partition}")
     if filter_gpu_type:
         filters.append(f"gpu: {filter_gpu_type}")
-    if filters:
-        title += f" ({', '.join(filters)})"
-    elif show_all:
-        title += " (all - press 'm' for mine)"
+    title = "JOBS" + (f" ({', '.join(filters)})" if filters else " (all - press 'm' for mine)")
     safe_addstr(win, y, 1, title, curses.color_pair(4) | curses.A_BOLD)
-    sort_indicator = f" [sort: {sort_key}]"
-    si_pos = min(len(title) + 3, width - len(sort_indicator) - 2)
-    if si_pos > 0:
-        safe_addstr(win, y, si_pos, sort_indicator, curses.color_pair(7) | curses.A_DIM)
+    safe_addstr(win, y, len(title) + 3, f"[sort: {sort_key}]", curses.color_pair(7) | curses.A_DIM)
     y += 1
 
-    display_jobs = jobs
+    display = jobs
     if filter_user:
-        display_jobs = [j for j in display_jobs if j["user"] == filter_user]
+        display = [j for j in display if j["user"] == filter_user]
     elif not show_all:
-        display_jobs = [j for j in display_jobs if j["user"] == current_user]
+        display = [j for j in display if j["user"] == current_user]
     if filter_partition:
-        display_jobs = [j for j in display_jobs if j["partition"] == filter_partition]
+        display = [j for j in display if j["partition"] == filter_partition]
     if filter_gpu_type:
-        display_jobs = [j for j in display_jobs
-                        if job_gpu_type(j, node_types).lower() == filter_gpu_type.lower()]
+        display = [j for j in display if job_gpu_type(j, node_types, partition_types).lower() == filter_gpu_type.lower()]
 
     sort_funcs = {
-        "id": lambda j: int(j["id"]) if j["id"].isdigit() else 0,
+        "id": lambda j: _int(j["id"].split("_")[0]),
         "user": lambda j: j["user"],
-        "state": lambda j: (0 if j["state"] == "RUNNING" else 1, j["state"]),
+        "state": lambda j: (0 if j["state"] == "RUNNING" else 1, j["state"], -j.get("priority", 0)),
         "partition": lambda j: j["partition"],
-        "time": lambda j: j["time"],
+        "time": lambda j: -(parse_time_to_seconds(j["time"]) or 0),
         "name": lambda j: j["name"],
+        "priority": lambda j: -j.get("priority", 0),
     }
-    display_jobs = sorted(display_jobs, key=sort_funcs.get(sort_key, sort_funcs["state"]))
+    display = sorted(display, key=sort_funcs.get(sort_key, sort_funcs["state"]))
 
-    running = sum(1 for j in display_jobs if j["state"] == "RUNNING")
-    pending = sum(1 for j in display_jobs if j["state"] == "PENDING")
-    other_count = len(display_jobs) - running - pending
-    summary = f" R:{running} PD:{pending}"
-    if other_count > 0:
-        summary += f" other:{other_count}"
-    summary += f" total:{len(display_jobs)}"
+    running = sum(1 for j in display if j["state"] == "RUNNING")
+    pending = sum(1 for j in display if j["state"] == "PENDING")
+    other = len(display) - running - pending
+    summary = f" R:{running} PD:{pending}" + (f" other:{other}" if other else "") + f" total:{len(display)}"
     safe_addstr(win, y, 2, summary, curses.color_pair(7))
     y += 1
     if y >= max_y - 1:
-        return y
+        return y, scroll
 
-    cols = [
-        ("JOBID", 10), ("PARTITION", 12), ("NAME", 24), ("USER", 10),
-        ("ST", 4), ("TIME", 12), ("LIMIT", 12), ("NODES", 5), ("CPUS", 5),
-        ("GPU", 14), ("REASON/NODELIST", 0),
-    ]
+    cols = [("JOBID", 10), ("PARTITION", 12), ("NAME", 24), ("USER", 10), ("ST", 4),
+            ("TIME", 12), ("LIMIT", 12), ("NODES", 5), ("CPUS", 5), ("GPU", 14), ("REASON/NODELIST", 0)]
     used = sum(c[1] for c in cols[:-1]) + len(cols)
     cols[-1] = (cols[-1][0], max(10, width - used - 2))
-
-    hdr = ""
-    for name, w in cols:
-        hdr += f" {name:<{w}}"
-    safe_addstr(win, y, 1, hdr[:width - 2], curses.color_pair(11) | curses.A_BOLD)
-    y += 1
+    y = _table_header(win, y, cols, width)
 
     visible = max_y - y - 2
     if visible <= 0:
-        return y
-    max_scroll = max(0, len(display_jobs) - visible)
-    actual_scroll = min(scroll_offset, max_scroll)
-
-    for idx in range(actual_scroll, min(actual_scroll + visible, len(display_jobs))):
+        return y, scroll
+    scroll = min(scroll, max(0, len(display) - visible))
+    for j in display[scroll:scroll + visible]:
         if y >= max_y - 1:
             break
-        j = display_jobs[idx]
         st = {"RUNNING": "R", "PENDING": "PD", "COMPLETING": "CG"}.get(j["state"], j["state"][:2])
-        gtype = job_gpu_type(j, node_types)
-        if gtype:
-            m = re.search(r'gpu[:\w]*?:(\d+)', j["gres"])
-            count = m.group(1) if m else "?"
-            gres_str = f"{gtype}:{count}"
-        else:
-            gres_str = ""
-        row = ""
-        for val, w in zip(
-            [j["id"], j["partition"], j["name"], j["user"], st,
-             j["time"], j["time_limit"], j["nodes"], j["cpus"], gres_str, j["reason"]],
-            [c[1] for c in cols]
-        ):
-            row += f" {val:<{w}}"
-
-        if j["state"] == "RUNNING":
-            attr = curses.color_pair(1)
-        elif j["state"] == "PENDING":
-            attr = curses.color_pair(2)
-        else:
-            attr = curses.color_pair(7) | curses.A_DIM
+        gtype = job_gpu_type(j, node_types, partition_types)
+        gres = (f"{gtype}:{job_gpu_count(j)}" if job_gpu_count(j) else gtype) if gtype else ""
+        vals = [j["id"], j["partition"], j["name"], j["user"], st, j["time"], j["time_limit"],
+                j["nodes"], j["cpus"], gres, j["reason"]]
+        row = "".join(f" {v:<{w}}" for v, (_, w) in zip(vals, cols))
+        attr = curses.color_pair(1) if j["state"] == "RUNNING" else curses.color_pair(2) if j["state"] == "PENDING" else curses.color_pair(7) | curses.A_DIM
         if j["user"] == current_user:
             attr |= curses.A_BOLD
         safe_addstr(win, y, 1, row[:width - 2], attr)
         y += 1
-
-    if len(display_jobs) > visible:
-        indicator = f" [{actual_scroll + 1}-{min(actual_scroll + visible, len(display_jobs))}/{len(display_jobs)}]"
-        safe_addstr(win, min(y, max_y - 1), 1, indicator, curses.color_pair(7) | curses.A_DIM)
-    return y, actual_scroll
+    _scroll_indicator(win, y, scroll, visible, len(display))
+    return y, scroll
 
 
 def draw_user_table(win, y, user_summary, width, current_user):
     max_y = win.getmaxyx()[0]
-    safe_addstr(win, y, 1, "TOP USERS", curses.color_pair(4) | curses.A_BOLD)
+    safe_addstr(win, y, 1, "TOP USERS (by GPUs, then running jobs)", curses.color_pair(4) | curses.A_BOLD)
     y += 1
-    sorted_users = sorted(user_summary.items(), key=lambda x: x[1]["running"], reverse=True)
-    hdr = f" {'USER':<12} {'RUN':>5} {'PEND':>5} {'CPUs':>7} {'GPUs':>5}"
-    safe_addstr(win, y, 1, hdr[:width - 2], curses.color_pair(11) | curses.A_BOLD)
+    rows = sorted(user_summary.items(), key=lambda kv: (kv[1]["gpus"], kv[1]["running"]), reverse=True)
+    safe_addstr(win, y, 1, f" {'USER':<12} {'RUN':>5} {'PEND':>5} {'CPUs':>7} {'GPUs':>5}"[:width - 2],
+                curses.color_pair(11) | curses.A_BOLD)
     y += 1
-    visible = min(20, max_y - y - 2)
-    for user, stats in sorted_users[:visible]:
-        if y >= max_y - 1:
-            break
-        row = f" {user:<12} {stats['running']:>5} {stats['pending']:>5} {stats['cpus']:>7} {stats['gpus']:>5}"
+    for user, s in rows[:max(0, max_y - y - 2)]:
+        row = f" {user:<12} {s['running']:>5} {s['pending']:>5} {s['cpus']:>7} {s['gpus']:>5}"
         attr = curses.color_pair(1) | curses.A_BOLD if user == current_user else curses.color_pair(7)
         safe_addstr(win, y, 1, row[:width - 2], attr)
         y += 1
     return y + 1
 
 
-# ── New Views ────────────────────────────────────────────────────────────────
-
-def draw_my_jobs(win, y, jobs, width, current_user, scroll_offset):
-    """View 4: Detailed view of current user's jobs."""
+def draw_my_jobs(win, y, jobs, width, current_user, scroll, nodes, priority_data):
     max_y = win.getmaxyx()[0]
     safe_addstr(win, y, 1, "MY JOBS", curses.color_pair(4) | curses.A_BOLD)
     y += 1
-
     my_jobs = [j for j in jobs if j["user"] == current_user]
     if not my_jobs:
         safe_addstr(win, y, 2, "No active jobs.", curses.color_pair(7) | curses.A_DIM)
-        return y + 2
-
-    running = [j for j in my_jobs if j["state"] == "RUNNING"]
-    pending = [j for j in my_jobs if j["state"] == "PENDING"]
-    other = [j for j in my_jobs if j["state"] not in ("RUNNING", "PENDING")]
-    summary = f" Running: {len(running)}  Pending: {len(pending)}"
-    if other:
-        summary += f"  Other: {len(other)}"
+        return y + 2, scroll
+    running = sum(1 for j in my_jobs if j["state"] == "RUNNING")
+    pending = sum(1 for j in my_jobs if j["state"] == "PENDING")
+    other = len(my_jobs) - running - pending
+    gpus_run = sum(job_gpu_count(j) for j in my_jobs if j["state"] == "RUNNING")
+    summary = f" Running: {running} ({gpus_run} GPUs)  Pending: {pending}" + (f"  Other: {other}" if other else "")
+    rank_by_id = {p["id"]: p["rank"] for p in priority_data}
+    if priority_data and pending:
+        best = min((rank_by_id.get(j["id"]) for j in my_jobs if j["id"] in rank_by_id), default=None)
+        if best:
+            summary += f"   best queue rank: {best}/{len(priority_data)}"
     safe_addstr(win, y, 2, summary, curses.color_pair(7))
     y += 1
 
-    cols = [
-        ("JOBID", 10), ("NAME", 28), ("ST", 4), ("PARTITION", 10),
-        ("ELAPSED", 12), ("LIMIT", 12), ("GPUs", 5), ("ETA/REMAINING", 0),
-    ]
+    cols = [("JOBID", 10), ("NAME", 28), ("ST", 4), ("PARTITION", 10), ("ELAPSED", 12),
+            ("LIMIT", 12), ("GPUs", 10), ("RANK", 6), ("ETA/REMAINING", 0)]
     used = sum(c[1] for c in cols[:-1]) + len(cols)
     cols[-1] = (cols[-1][0], max(15, width - used - 2))
+    y = _table_header(win, y, cols, width)
 
-    hdr = ""
-    for name, w in cols:
-        hdr += f" {name:<{w}}"
-    safe_addstr(win, y, 1, hdr[:width - 2], curses.color_pair(11) | curses.A_BOLD)
-    y += 1
-
-    # Sort: running first, then pending
-    display = sorted(my_jobs, key=lambda j: (0 if j["state"] == "RUNNING" else 1 if j["state"] == "PENDING" else 2))
-
+    order = {"RUNNING": 0, "PENDING": 1}
+    display = sorted(my_jobs, key=lambda j: (order.get(j["state"], 2), -j.get("priority", 0)))
     visible = max_y - y - 2
     if visible <= 0:
-        return y
-    max_scroll = max(0, len(display) - visible)
-    actual_scroll = min(scroll_offset, max_scroll)
-
-    for idx in range(actual_scroll, min(actual_scroll + visible, len(display))):
+        return y, scroll
+    scroll = min(scroll, max(0, len(display) - visible))
+    for j in display[scroll:scroll + visible]:
         if y >= max_y - 1:
             break
-        j = display[idx]
         st = {"RUNNING": "R", "PENDING": "PD", "COMPLETING": "CG"}.get(j["state"], j["state"][:2])
-
-        # Parse GPUs
-        gpus = 0
-        m = re.search(r'gpu[:\w]*?:(\d+)', j["gres"])
-        nodes = int(j["nodes"]) if j["nodes"].strip().isdigit() else 1
-        if m:
-            gpus = int(m.group(1)) * nodes
-        gpu_str = str(gpus) if gpus > 0 else "-"
-
-        # ETA calculation
-        eta_str = ""
-        if j["state"] == "RUNNING":
-            elapsed_s = parse_time_to_seconds(j["time"])
-            limit_s = parse_time_to_seconds(j["time_limit"])
-            if elapsed_s is not None and limit_s is not None:
-                remaining = limit_s - elapsed_s
-                eta_str = f"{seconds_to_human(remaining)} left"
-            else:
-                eta_str = "-"
-        elif j["state"] == "PENDING":
-            st_str = j.get("start_time", "")
-            if st_str and st_str not in ("N/A", "Unknown", ""):
-                try:
-                    # Try parsing scheduled start time
-                    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-                        try:
-                            start_dt = datetime.strptime(st_str, fmt)
-                            delta = start_dt - datetime.now()
-                            if delta.total_seconds() > 0:
-                                eta_str = f"in {seconds_to_human(delta.total_seconds())}"
-                            else:
-                                eta_str = "starting..."
-                            break
-                        except ValueError:
-                            continue
-                except Exception:
-                    pass
-            if not eta_str:
-                reason = j.get("reason", "")
-                if reason and reason not in ("None",):
-                    eta_str = reason[:cols[-1][1]]
-                else:
-                    eta_str = "waiting"
-
-        row_vals = [j["id"], j["name"], st, j["partition"], j["time"],
-                    j["time_limit"], gpu_str, eta_str]
-        row = ""
-        for val, (_, w) in zip(row_vals, cols):
-            row += f" {val:<{w}}"
-
-        if j["state"] == "RUNNING":
-            attr = curses.color_pair(1) | curses.A_BOLD
-        elif j["state"] == "PENDING":
-            attr = curses.color_pair(2) | curses.A_BOLD
-        else:
-            attr = curses.color_pair(7) | curses.A_DIM
+        n = job_gpu_count(j)
+        gtype = job_gpu_type(j, nodes.get("node_types", {}), nodes.get("partition_types", {}))
+        gpu_str = f"{n} {gtype}"[:10] if n else "-"
+        rank = rank_by_id.get(j["id"])
+        eta, _ = job_eta(j)
+        vals = [j["id"], j["name"], st, j["partition"], j["time"], j["time_limit"], gpu_str,
+                str(rank) if rank else "-", eta[:cols[-1][1]]]
+        row = "".join(f" {v:<{w}}" for v, (_, w) in zip(vals, cols))
+        attr = (curses.color_pair(1) if j["state"] == "RUNNING" else curses.color_pair(2)
+                if j["state"] == "PENDING" else curses.color_pair(7)) | curses.A_BOLD
         safe_addstr(win, y, 1, row[:width - 2], attr)
         y += 1
-
-    if len(display) > visible:
-        indicator = f" [{actual_scroll + 1}-{min(actual_scroll + visible, len(display))}/{len(display)}]"
-        safe_addstr(win, min(y, max_y - 1), 1, indicator, curses.color_pair(7) | curses.A_DIM)
-    return y + 1, actual_scroll
+    _scroll_indicator(win, y, scroll, visible, len(display))
+    return y + 1, scroll
 
 
-def draw_priority(win, y, priority_data, width, scroll_offset):
-    """View 5: Priority breakdown."""
+def draw_priority(win, y, priority_data, width, current_user, scroll, mine_only):
     max_y = win.getmaxyx()[0]
-    safe_addstr(win, y, 1, "PRIORITY BREAKDOWN", curses.color_pair(4) | curses.A_BOLD)
+    title = "PRIORITY QUEUE" + (" (my jobs - press 'a' for all)" if mine_only else " (all pending - press 'm' for mine)")
+    safe_addstr(win, y, 1, title, curses.color_pair(4) | curses.A_BOLD)
     y += 1
-
     if not priority_data:
-        safe_addstr(win, y, 2, "No pending jobs with priority data.", curses.color_pair(7) | curses.A_DIM)
-        return y + 2
+        safe_addstr(win, y, 2, "No pending jobs.", curses.color_pair(7) | curses.A_DIM)
+        return y + 2, scroll
+    mine = [p for p in priority_data if p["user"] == current_user]
+    display = mine if mine_only else priority_data
+    if not display:
+        safe_addstr(win, y, 2, "You have no pending jobs.", curses.color_pair(7) | curses.A_DIM)
+        return y + 2, scroll
+    w_fs = CLUSTER["w_fairshare"]
+    if mine:
+        best = min(mine, key=lambda p: p["rank"])
+        fs_factor = f", fairshare factor {best['fairshare'] / w_fs:.3f}" if w_fs else ""
+        safe_addstr(win, y, 2, f"My best queue rank: {best['rank']}/{len(priority_data)}  (job {best['id']}{fs_factor})",
+                    curses.color_pair(1) | curses.A_BOLD)
+        y += 1
 
-    AGE_MAX = 1_000_000
-
-    cols = [
-        ("JOBID", 10), ("PRIORITY", 10), ("AGE", 10), ("FAIRSHARE", 10),
-        ("PARTITION", 10), ("QOS", 10), ("NICE", 6), ("AGE PROGRESS", 0),
-    ]
+    cols = [("RANK", 5), ("JOBID", 9), ("USER", 9), ("ACCOUNT", 11), ("PART", 8), ("PRIORITY", 9),
+            ("FAIRSHARE", 9), ("QOS", 8), ("PART", 7), ("SIZE", 6), ("AGE", 7), ("NICE", 5),
+            ("COMPOSITION (F=fairshare Q=qos P=partition S=size A=age)", 0)]
     used = sum(c[1] for c in cols[:-1]) + len(cols)
-    cols[-1] = (cols[-1][0], max(20, width - used - 2))
-
-    hdr = ""
-    for name, w in cols:
-        hdr += f" {name:<{w}}"
-    safe_addstr(win, y, 1, hdr[:width - 2], curses.color_pair(11) | curses.A_BOLD)
-    y += 1
+    cols[-1] = (cols[-1][0], max(15, width - used - 2))
+    y = _table_header(win, y, cols, width)
 
     visible = max_y - y - 4
     if visible <= 0:
-        return y
-    max_scroll = max(0, len(priority_data) - visible)
-    actual_scroll = min(scroll_offset, max_scroll)
-
-    for idx in range(actual_scroll, min(actual_scroll + visible, len(priority_data))):
+        return y, scroll
+    scroll = min(scroll, max(0, len(display) - visible))
+    scale = max(p["priority"] for p in priority_data) or 1
+    for p in display[scroll:scroll + visible]:
         if y >= max_y - 3:
             break
-        p = priority_data[idx]
-
-        # Text portion
-        text_vals = [
-            p["id"], str(p["priority"]), str(p["age"]), str(p["fairshare"]),
-            str(p["partition"]), str(p["qos"]), str(p["nice"]),
-        ]
-        row = ""
-        for val, (_, w) in zip(text_vals, cols[:-1]):
-            row += f" {val:<{w}}"
-        safe_addstr(win, y, 1, row[:width - 2], curses.color_pair(7))
-
-        # Age progress bar inline
+        vals = [str(p["rank"]), p["id"], p["user"][:9], p["account"][:11], p["partition_name"][:8],
+                str(p["priority"]), str(p["fairshare"]), str(p["qos"]), str(p["partition"]),
+                str(p["jobsize"]), str(p["age"]), str(p["nice"])]
+        row = "".join(f" {v:<{w}}" for v, (_, w) in zip(vals, cols[:-1]))
+        is_me = p["user"] == current_user
+        safe_addstr(win, y, 1, row[:width - 2], curses.color_pair(1) | curses.A_BOLD if is_me else curses.color_pair(7))
         bar_x = len(row) + 2
-        bar_w = min(cols[-1][1], width - bar_x - 5)
-        if bar_w > 5:
-            age_frac = min(1.0, p["age"] / AGE_MAX) if AGE_MAX > 0 else 0
-            draw_bar(win, y, bar_x, bar_w, age_frac, "")
+        bar_w = min(cols[-1][1], width - bar_x - 3)
+        if bar_w > 8:
+            inner = bar_w - 2
+            safe_addstr(win, y, bar_x, "[", curses.color_pair(7))
+            x = bar_x + 1
+            for ch_, val, cp in (("F", p["fairshare"], 1), ("Q", p["qos"], 6), ("P", p["partition"], 4),
+                                 ("S", p["jobsize"], 7), ("A", p["age"], 2)):
+                n = int(inner * max(0, val) / scale)
+                if n > 0 and x + n <= bar_x + bar_w - 1:
+                    safe_addstr(win, y, x, ch_ * n, curses.color_pair(cp) | curses.A_BOLD)
+                    x += n
+            safe_addstr(win, y, bar_x + bar_w - 1, "]", curses.color_pair(7))
         y += 1
-
-    # Legend
     y += 1
     if y < max_y - 1:
-        safe_addstr(win, y, 2, "Age: grows ~1,389/hr toward 1M max  |  Higher priority = scheduled sooner",
+        safe_addstr(win, y, 2, (priority_summary_line() + "  |  bar scaled to top of queue")[:width - 3],
                     curses.color_pair(7) | curses.A_DIM)
         y += 1
-
-    if len(priority_data) > visible:
-        indicator = f" [{actual_scroll + 1}-{min(actual_scroll + visible, len(priority_data))}/{len(priority_data)}]"
-        safe_addstr(win, min(y, max_y - 1), 1, indicator, curses.color_pair(7) | curses.A_DIM)
-
-    return y + 1, actual_scroll
+    _scroll_indicator(win, y, scroll, visible, len(display))
+    return y + 1, scroll
 
 
-def draw_fairshare(win, y, fs_data, width):
-    """View 6: FairShare details."""
+def draw_fairshare(win, y, tree, width, current_user):
     max_y = win.getmaxyx()[0]
-    safe_addstr(win, y, 1, "FAIRSHARE", curses.color_pair(4) | curses.A_BOLD)
+    safe_addstr(win, y, 1, "FAIRSHARE (fair tree: account level, then user level)", curses.color_pair(4) | curses.A_BOLD)
     y += 1
-
-    if not fs_data or not fs_data["accounts"]:
-        safe_addstr(win, y, 2, "No fairshare data available.", curses.color_pair(7) | curses.A_DIM)
+    if not tree or not tree.get("my_accounts"):
+        safe_addstr(win, y, 2, "No fairshare data available (loading or no association).", curses.color_pair(7) | curses.A_DIM)
         return y + 2
-
-    bar_width = min(40, width - 50)
-    if bar_width < 10:
-        bar_width = 10
-
-    for acc in fs_data["accounts"]:
-        if y >= max_y - 6:
+    bar_width = max(10, min(40, width - 50))
+    for s in fairshare_summary(tree, current_user):
+        if y >= max_y - 10:
             break
-        safe_addstr(win, y, 2, f"Account: {acc['account']}", curses.color_pair(4) | curses.A_BOLD)
+        me, acct = s["me"], s["account_row"]
+        fs_val = me["fairshare"]
+        fs_color, fs_label = (3, "LOW") if fs_val < 0.3 else (2, "MED") if fs_val < 0.6 else (1, "HIGH")
+        safe_addstr(win, y, 2, f"{current_user} @ {s['account']}", curses.color_pair(4) | curses.A_BOLD)
         y += 1
-
-        # FairShare score with bar
-        fs_val = acc["fairshare"]
-        if fs_val < 0.3:
-            fs_color = 3  # red
-            fs_label = "LOW"
-        elif fs_val < 0.6:
-            fs_color = 2  # yellow
-            fs_label = "MED"
-        else:
-            fs_color = 1  # green
-            fs_label = "HIGH"
-
         safe_addstr(win, y, 4, f"FairShare: {fs_val:.4f}", curses.color_pair(7))
         draw_colored_bar(win, y, 26, bar_width, fs_val, fs_color)
-        bar_end = 26 + bar_width + 1
-        safe_addstr(win, y, bar_end, f" {fs_label}", curses.color_pair(fs_color) | curses.A_BOLD)
-        y += 1
+        extra = f" {fs_label}" + (f"  -> +{s['priority_contribution']:,} priority" if CLUSTER["w_fairshare"] else "")
+        safe_addstr(win, y, 27 + bar_width, extra, curses.color_pair(fs_color) | curses.A_BOLD)
+        y += 2
 
-        # LevelFS
-        safe_addstr(win, y, 4, f"LevelFS: {acc['level_fs']}", curses.color_pair(7))
-        y += 1
-
-        # Raw usage
-        safe_addstr(win, y, 4, f"Raw Usage: {format_usage(acc['raw_usage'])}",
-                    curses.color_pair(7))
-        safe_addstr(win, y, 30, f"Norm Shares: {acc['norm_shares']:.6f}",
-                    curses.color_pair(7) | curses.A_DIM)
-        safe_addstr(win, y, 55, f"Effectv Usage: {acc['effectv_usage']:.6f}",
-                    curses.color_pair(7) | curses.A_DIM)
-        y += 1
-
-        # Usage vs group average (if we have group data and it's the GPU account)
-        if fs_data.get("group_data") and acc["account"] == fs_data.get("gpu_account"):
-            gd = fs_data["group_data"]
-            group_total_usage = gd["raw_usage"]
-            # Count users in group from leaderboard or estimate
-            # Use norm_shares to estimate: if user has norm_shares of 1/N, then N users
-            if acc["norm_shares"] > 0:
-                estimated_users = round(1.0 / acc["norm_shares"])
-            else:
-                estimated_users = 1
-            avg_usage = group_total_usage / estimated_users if estimated_users > 0 else 0
-
-            if avg_usage > 0 and acc["raw_usage"] > 0:
-                usage_pct = (acc["raw_usage"] / avg_usage) * 100
-                if usage_pct < 100:
-                    usage_color = 1  # green
-                elif usage_pct < 200:
-                    usage_color = 2  # yellow
-                else:
-                    usage_color = 3  # red
-                safe_addstr(win, y, 4, f"Usage vs group avg: {usage_pct:.0f}%",
-                            curses.color_pair(usage_color) | curses.A_BOLD)
-                safe_addstr(win, y, 35, f"(my: {format_usage(acc['raw_usage'])} / avg: {format_usage(int(avg_usage))})",
-                            curses.color_pair(7) | curses.A_DIM)
-            else:
-                safe_addstr(win, y, 4, "Usage vs group avg: 0% (no usage)",
-                            curses.color_pair(1))
+        if acct:
+            safe_addstr(win, y, 4, f"Level 1  {s['account']} among {s['n_accounts']} accounts",
+                        curses.color_pair(6) | curses.A_BOLD)
             y += 1
+            ratio = s["account_usage_vs_share"] or 0
+            c = 1 if ratio < 0.8 else 2 if ratio < 1.2 else 3
+            safe_addstr(win, y, 6,
+                        f"rank {acct['rank']}/{s['n_accounts']}   LevelFS {fmt_lfs(acct['level_fs'])}   "
+                        f"share {acct['norm_shares'] * 100:.1f}% of cluster, using {acct['norm_usage'] * 100:.1f}%",
+                        curses.color_pair(7))
+            y += 1
+            t = acct["tres_run_mins"]
+            per_type = ", ".join(f"{k} {v}" for k, v in t.items() if k not in ("cpu", "gpu") and v)
+            safe_addstr(win, y, 6, f"GPU-minutes reserved by account's running jobs: {t.get('gpu', 0)}"
+                        + (f" ({per_type})" if per_type else ""), curses.color_pair(7) | curses.A_DIM)
+            y += 1
+            msg = ("account under-using its share -> good for everyone in it" if ratio < 0.8 else
+                   "account near its share" if ratio < 1.2 else
+                   "account over-using its share -> whole group ranks lower")
+            safe_addstr(win, y, 6, msg, curses.color_pair(c))
+            y += 2
 
+        safe_addstr(win, y, 4, f"Level 2  {current_user} among {s['n_members']} members of {s['account']}",
+                    curses.color_pair(6) | curses.A_BOLD)
+        y += 1
+        c = 1 if s["my_share_of_account"] <= s["fair_share_of_account"] else 2 if s["my_share_of_account"] <= 2 * s["fair_share_of_account"] else 3
+        safe_addstr(win, y, 6,
+                    f"rank {me.get('rank', '?')}/{s['n_members']}   LevelFS {fmt_lfs(me['level_fs'])}   "
+                    f"my usage {format_usage(me['raw_usage'])} = {s['my_share_of_account'] * 100:.1f}% of account "
+                    f"(equal share {s['fair_share_of_account'] * 100:.1f}%)", curses.color_pair(c))
+        y += 1
+        if s["heaviest_member"]:
+            hm = s["heaviest_member"]
+            who = "you" if hm["user"] == current_user else hm["user"]
+            safe_addstr(win, y, 6, f"{s['n_active_members']} active member(s); heaviest: {who} at {hm['share'] * 100:.0f}% of account usage",
+                        curses.color_pair(7) | curses.A_DIM)
+            y += 1
+        if s["hours_to_fair_me"] is not None:
+            def _ttf(h):
+                return "already fair" if h == 0 else "~{:.1f}h idle".format(h)
+            parts = ["you: " + _ttf(s["hours_to_fair_me"])]
+            if s["hours_to_fair_account"] is not None:
+                parts.append("account: " + _ttf(s["hours_to_fair_account"]))
+            safe_addstr(win, y, 6, "Time to LevelFS=1 (optimistic): " + "   ".join(parts), curses.color_pair(6))
+            y += 1
         y += 1
 
+    if y < max_y - 2:
+        hl = CLUSTER["half_life_s"]
+        decay = (f"Usage decays with {seconds_to_human(hl)} half-life." if hl else
+                 f"Usage reset: {CLUSTER['usage_reset']}." if CLUSTER["usage_reset"] not in ("", "NONE") else
+                 "Usage never decays or resets on this cluster.")
+        safe_addstr(win, y, 2, f"{decay} Running jobs count immediately. GPU-minutes are billed per type.",
+                    curses.color_pair(7) | curses.A_DIM)
+        y += 1
     return y
 
 
-def draw_leaderboard(win, y, leaderboard, width, current_user, scroll_offset):
-    """View 7: Group leaderboard."""
+def draw_leaderboard(win, y, tree, width, current_user, scroll, level, acct_idx, show_idle):
+    """level='acct': all accounts. level='user': members of one of my accounts."""
     max_y = win.getmaxyx()[0]
-    safe_addstr(win, y, 1, "GROUP LEADERBOARD (GPU Account)", curses.color_pair(4) | curses.A_BOLD)
+    if not tree or not tree.get("accounts"):
+        safe_addstr(win, y, 1, "LEADERBOARD", curses.color_pair(4) | curses.A_BOLD)
+        safe_addstr(win, y + 1, 2, "No data available (loading).", curses.color_pair(7) | curses.A_DIM)
+        return y + 3, scroll
+    my_accts = [m["account"] for m in tree["my_accounts"]] or [""]
+    my_acct = my_accts[acct_idx % len(my_accts)]
+    if level == "acct":
+        rows = [r for r in tree["accounts"] if r["raw_shares"] > 0 or r["raw_usage"] > 0]
+        title = f"ACCOUNTS (fair-tree level 1, sorted by LevelFS; mine = {', '.join(a for a in my_accts if a)})"
+        name_key = "account"
+        is_mine = lambda r: r["account"] in my_accts
+    else:
+        rows = tree["users"].get(my_acct, [])
+        if not show_idle:
+            rows = [r for r in rows if r["raw_usage"] > 0 or r["user"] == current_user]
+        title = f"MEMBERS OF {my_acct} (fair-tree level 2, sorted by LevelFS)"
+        name_key = "user"
+        is_mine = lambda r: r["user"] == current_user
+    safe_addstr(win, y, 1, title[:width - 2], curses.color_pair(4) | curses.A_BOLD)
     y += 1
+    hint = "l: accounts/members" + ("  t: next account" if len(my_accts) > 1 else "") + \
+           (f"  i: {'hide' if show_idle else 'show'} idle" if level == "user" else "")
+    safe_addstr(win, y, 2, hint, curses.color_pair(7) | curses.A_DIM)
+    y += 1
+    if not rows:
+        safe_addstr(win, y, 2, "No entries.", curses.color_pair(7) | curses.A_DIM)
+        return y + 2, scroll
 
-    if not leaderboard:
-        safe_addstr(win, y, 2, "No leaderboard data available.", curses.color_pair(7) | curses.A_DIM)
-        return y + 2
-
-    # Filter out zero-usage users for a cleaner view, but keep current user
-    active_users = [u for u in leaderboard if u["raw_usage"] > 0 or u["user"] == current_user]
-    if not active_users:
-        active_users = leaderboard[:10]
-
-    total_usage = sum(u["raw_usage"] for u in active_users)
-
-    bar_width = min(25, width - 75)
-    if bar_width < 5:
-        bar_width = 5
-
-    hdr = f" {'#':>3} {'USER':<12} {'USAGE':>10} {'SHARE%':>7} {'EFF.USAGE':>10} {'FAIRSHARE':>9} {'LFS':>6}  {'USAGE BAR'}"
+    total_usage = sum(r["raw_usage"] for r in rows) or 1
+    max_usage = max(r["raw_usage"] for r in rows) or 1
+    root_tres = (tree.get("root") or {}).get("tres_run_mins", {})
+    gpu_types = sorted((k for k, v in root_tres.items() if k not in ("cpu", "gpu") and v), key=lambda k: -root_tres[k])[:3]
+    bar_width = max(5, min(25, width - 90 - 7 * len(gpu_types)))
+    hdr = f" {'#':>3} {'NAME':<12} {'SHARE%':>7} {'USAGE%':>7} {'RAWUSAGE':>9} {'LEVELFS':>8} {'GPU-MIN':>8}"
+    hdr += "".join(f" {t[:6].upper():>6}" for t in gpu_types) + f" {'FAIRSHARE':>9}  USAGE"
     safe_addstr(win, y, 1, hdr[:width - 2], curses.color_pair(11) | curses.A_BOLD)
     y += 1
-
     visible = max_y - y - 2
     if visible <= 0:
-        return y
-    max_scroll = max(0, len(active_users) - visible)
-    actual_scroll = min(scroll_offset, max_scroll)
-
-    max_usage = active_users[0]["raw_usage"] if active_users else 1
-
-    for idx in range(actual_scroll, min(actual_scroll + visible, len(active_users))):
+        return y, scroll
+    scroll = min(scroll, max(0, len(rows) - visible))
+    for idx in range(scroll, min(scroll + visible, len(rows))):
         if y >= max_y - 1:
             break
-        u = active_users[idx]
-        rank = idx + 1
-        share_pct = (u["raw_usage"] / total_usage * 100) if total_usage > 0 else 0
-        lfs = u["level_fs"]
-        if lfs == "inf":
-            lfs_str = "inf"
-        else:
-            try:
-                lfs_str = f"{float(lfs):.3f}"
-            except ValueError:
-                lfs_str = lfs[:6]
-
-        row = f" {rank:>3} {u['user']:<12} {format_usage(u['raw_usage']):>10} {share_pct:>6.1f}% {u['effectv_usage']:>10.6f} {u['fairshare']:>9.4f} {lfs_str:>6}  "
-        is_me = u["user"] == current_user
-
-        if is_me:
-            attr = curses.color_pair(1) | curses.A_BOLD
-        else:
-            attr = curses.color_pair(7)
-
-        safe_addstr(win, y, 1, row[:width - bar_width - 6], attr)
-
-        # Usage bar
+        r = rows[idx]
+        t = r["tres_run_mins"]
+        fs = f"{r['fairshare']:.4f}" if r["fairshare"] else "-"
+        row = (f" {r.get('rank', idx + 1):>3} {r[name_key][:12]:<12} {r['norm_shares'] * 100:>6.1f}% "
+               f"{r['raw_usage'] / total_usage * 100:>6.1f}% {format_usage(r['raw_usage']):>9} "
+               f"{fmt_lfs(r['level_fs']):>8} {t.get('gpu', 0):>8}")
+        row += "".join(f" {t.get(g, 0):>6}" for g in gpu_types) + f" {fs:>9}  "
+        me = is_mine(r)
+        safe_addstr(win, y, 1, row[:width - 2], curses.color_pair(1) | curses.A_BOLD if me else curses.color_pair(7))
         bar_x = len(row) + 1
         if bar_x + bar_width < width - 3:
-            frac = u["raw_usage"] / max_usage if max_usage > 0 else 0
-            color = 1 if is_me else 4
-            draw_colored_bar(win, y, bar_x, bar_width, frac, color)
-            if is_me:
-                marker_x = bar_x + bar_width + 1
-                if marker_x + 2 < width:
-                    safe_addstr(win, y, marker_x, "<<", curses.color_pair(1) | curses.A_BOLD)
+            draw_colored_bar(win, y, bar_x, bar_width, r["raw_usage"] / max_usage, 1 if me else 4)
+            if me and bar_x + bar_width + 3 < width:
+                safe_addstr(win, y, bar_x + bar_width + 1, "<<", curses.color_pair(1) | curses.A_BOLD)
         y += 1
-
-    if len(active_users) > visible:
-        indicator = f" [{actual_scroll + 1}-{min(actual_scroll + visible, len(active_users))}/{len(active_users)}]"
-        safe_addstr(win, min(y, max_y - 1), 1, indicator, curses.color_pair(7) | curses.A_DIM)
-    return y + 1, actual_scroll
+    _scroll_indicator(win, y, scroll, visible, len(rows))
+    return y + 1, scroll
 
 
-def draw_history(win, y, history, width, scroll_offset):
-    """View 9: Recent job history."""
+def draw_history(win, y, history, width, scroll):
     max_y = win.getmaxyx()[0]
     safe_addstr(win, y, 1, "RECENT HISTORY (last 7 days)", curses.color_pair(4) | curses.A_BOLD)
     y += 1
-
     if not history:
         safe_addstr(win, y, 2, "No recent jobs found.", curses.color_pair(7) | curses.A_DIM)
-        return y + 2
-
-    cols = [
-        ("JOBID", 10), ("NAME", 32), ("STATE", 12), ("EXIT", 6),
-        ("ELAPSED", 12), ("PARTITION", 12), ("GPUs", 5),
-    ]
-
-    hdr = ""
-    for name, w in cols:
-        hdr += f" {name:<{w}}"
-    safe_addstr(win, y, 1, hdr[:width - 2], curses.color_pair(11) | curses.A_BOLD)
-    y += 1
-
+        return y + 2, scroll
+    cols = [("JOBID", 10), ("NAME", 32), ("STATE", 12), ("EXIT", 6), ("ELAPSED", 12),
+            ("PARTITION", 12), ("GPUs", 10), ("END", 19)]
+    y = _table_header(win, y, cols, width)
     visible = max_y - y - 2
     if visible <= 0:
-        return y
-    max_scroll = max(0, len(history) - visible)
-    actual_scroll = min(scroll_offset, max_scroll)
-
-    for idx in range(actual_scroll, min(actual_scroll + visible, len(history))):
+        return y, scroll
+    display = list(reversed(history))  # most recent first
+    scroll = min(scroll, max(0, len(display) - visible))
+    for j in display[scroll:scroll + visible]:
         if y >= max_y - 1:
             break
-        j = history[idx]
-        gpu_str = str(j["gpus"]) if j["gpus"] > 0 else "-"
-        row_vals = [j["id"], j["name"], j["state"], j["exit_code"],
-                    j["elapsed"], j["partition"], gpu_str]
-        row = ""
-        for val, (_, w) in zip(row_vals, cols):
-            row += f" {val:<{w}}"
-
-        state = j["state"]
-        if state in ("COMPLETED", "RUNNING"):
-            attr = curses.color_pair(1)
-        elif state in ("TIMEOUT", "FAILED", "NODE_FAIL", "OUT_OF_MEMORY"):
-            attr = curses.color_pair(3) | curses.A_BOLD
-        elif state in ("CANCELLED", "CANCELLED+"):
-            attr = curses.color_pair(2)
-        else:
-            attr = curses.color_pair(7)
-
+        gpu_str = (f"{j['gpus']} {j['gpu_type']}".strip() if j["gpus"] else "-")[:10]
+        vals = [j["id"], j["name"], j["state"], j["exit_code"], j["elapsed"], j["partition"], gpu_str, j.get("end", "")]
+        row = "".join(f" {v:<{w}}" for v, (_, w) in zip(vals, cols))
+        st = j["state"]
+        attr = (curses.color_pair(1) if st in ("COMPLETED", "RUNNING") else
+                curses.color_pair(3) | curses.A_BOLD if st in ("TIMEOUT", "FAILED", "NODE_FAIL", "OUT_OF_MEMORY") else
+                curses.color_pair(2) if st.startswith("CANCELLED") else curses.color_pair(7))
         safe_addstr(win, y, 1, row[:width - 2], attr)
         y += 1
-
-    if len(history) > visible:
-        indicator = f" [{actual_scroll + 1}-{min(actual_scroll + visible, len(history))}/{len(history)}]"
-        safe_addstr(win, min(y, max_y - 1), 1, indicator, curses.color_pair(7) | curses.A_DIM)
-    return y + 1, actual_scroll
+    _scroll_indicator(win, y, scroll, visible, len(display))
+    return y + 1, scroll
 
 
 def draw_footer(win, height, width, view_mode):
-    views = "1:Main 2:MyJobs 3:Priority 4:FairShare 5:Leaderboard 6:History"
+    views = "1:Main 2:MyJobs 3:Priority 4:FairShare 5:Leaderboard 6:History u:Users"
     keys = f" {views} | q:Quit r:Refresh s:Sort /:User p:Part g:GPU a/m:All/My +/-:Intv"
+    if view_mode == "leaderboard":
+        keys += " l:Level t:Acct i:Idle"
+    safe_addstr(win, height - 1, 0, " " * (width - 1), curses.color_pair(5))
+    safe_addstr(win, height - 1, 1, keys[:width - 2], curses.color_pair(5))
+
+
+def prompt_input(stdscr, height, width, prompt):
+    curses.curs_set(1)
+    stdscr.nodelay(False)
     try:
-        safe_addstr(win, height - 1, 0, " " * (width - 1), curses.color_pair(5))
-        safe_addstr(win, height - 1, 1, keys[:width - 2], curses.color_pair(5))
+        safe_addstr(stdscr, height - 1, 0, " " * (width - 1), curses.color_pair(5))
+        safe_addstr(stdscr, height - 1, 1, prompt[:width - 2], curses.color_pair(5))
+        stdscr.refresh()
+        curses.echo()
+        inp = stdscr.getstr(height - 1, min(len(prompt) + 1, width - 2), 30).decode("utf-8", "ignore").strip()
+        curses.noecho()
     except curses.error:
-        pass
+        inp = ""
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(300)
+    return inp
 
 
-# ── Main Loop ────────────────────────────────────────────────────────────────
-
-VIEW_NAMES = {
-    "main": "Main",
-    "users": "Users",
-    "my_jobs": "My Jobs",
-    "priority": "Priority",
-    "fairshare": "FairShare",
-    "leaderboard": "Leaderboard",
-    "history": "History",
-}
+VIEW_NAMES = {"main": "Main", "users": "Users", "my_jobs": "My Jobs", "priority": "Priority",
+              "fairshare": "FairShare", "leaderboard": "Leaderboard", "history": "History"}
 
 
-def main(stdscr):
+def main(stdscr, current_user):
     global REFRESH_INTERVAL
-
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(300)
     init_colors()
 
-    current_user = os.environ.get("USER", "unknown")
-    scroll_offset = 0
-    sort_key = "state"
-    sort_keys = ["state", "id", "user", "partition", "time", "name"]
+    scroll = 0
+    sort_keys = ["state", "priority", "id", "user", "partition", "time", "name"]
     sort_idx = 0
     show_all = True
-    filter_user = ""
-    filter_partition = ""
-    filter_gpu_type = ""
+    filter_user = filter_partition = filter_gpu_type = ""
     view_mode = "main"
+    lb_level, lb_acct_idx, lb_show_idle = "acct", 0, False
 
-    # Data caches
-    partitions = {}
-    node_states = {}
-    gpu_by_type = {}
-    node_types = {}
-    total_gpus = 0
-    total_gpu_alloc = 0
-    jobs = []
-    user_summary = {}
-    priority_data = []
-    fs_data = {}
-    leaderboard = []
-    history = []
-    last_fetch = 0
-    last_slow_fetch = 0  # for slower-updating data
-    SLOW_INTERVAL = 15  # seconds for fairshare/leaderboard/history
+    partitions, nodes, jobs, user_summary = {}, {}, [], {}
+    priority_data, fs_tree, history = [], {}, []
+    last_fetch = last_slow_fetch = 0
+    fetched_slow = set()
 
     while True:
         now = time.time()
-
-        # Fast data (sinfo, squeue)
         if now - last_fetch >= REFRESH_INTERVAL:
-            partitions = get_partitions()
-            node_states = get_node_summary()
-            gpu_by_type, node_types, total_gpus, total_gpu_alloc = get_gpu_info()
-            jobs = get_jobs()
+            partitions, nodes, jobs = fetch_fast()
+            annotate_partitions(partitions, nodes)
             user_summary = get_user_summary(jobs)
             last_fetch = now
-
-        # Slow data (sprio, sshare, sacct) - only fetch when in relevant view or stale
-        if now - last_slow_fetch >= SLOW_INTERVAL:
+        if now - last_slow_fetch >= SLOW_INTERVAL or view_mode not in fetched_slow:
             if view_mode in ("priority", "my_jobs"):
-                priority_data = get_priority_data(current_user)
-            if view_mode == "fairshare":
-                fs_data = get_fairshare_data(current_user)
-            if view_mode == "leaderboard":
-                if not fs_data or not fs_data.get("gpu_account"):
-                    fs_data = get_fairshare_data(current_user)
-                leaderboard = get_group_leaderboard(fs_data.get("gpu_account"))
+                priority_data = get_priority_data()
+            if view_mode in ("fairshare", "leaderboard"):
+                fs_tree = get_sshare_tree(current_user)
             if view_mode == "history":
                 history = get_recent_history(current_user)
+            fetched_slow.add(view_mode)
             last_slow_fetch = now
 
-        # Draw
         stdscr.erase()
         height, width = stdscr.getmaxyx()
-
         if height < 10 or width < 40:
             safe_addstr(stdscr, 0, 0, "Terminal too small. Resize to at least 40x10.")
             stdscr.refresh()
             time.sleep(0.5)
             continue
 
-        y = 0
-        y = draw_header(stdscr, y, width, current_user, VIEW_NAMES.get(view_mode, ""))
-
+        y = draw_header(stdscr, 0, width, current_user, VIEW_NAMES.get(view_mode, ""))
         if view_mode == "main":
-            y = draw_partition_bars(stdscr, y, partitions, gpu_by_type, total_gpus, total_gpu_alloc, width)
-            y = draw_node_summary(stdscr, y, node_states, width)
-            result = draw_job_table(
-                stdscr, y, jobs, width, scroll_offset, sort_key,
-                current_user, show_all, filter_user, filter_partition,
-                filter_gpu_type, node_types
-            )
-            if isinstance(result, tuple):
-                y, scroll_offset = result
-            else:
-                y = result
-
+            y = draw_partition_bars(stdscr, y, partitions, nodes, width)
+            y = draw_node_summary(stdscr, y, nodes.get("node_states", {}), width)
+            y, scroll = draw_job_table(stdscr, y, jobs, width, scroll, sort_keys[sort_idx], current_user,
+                                       show_all, filter_user, filter_partition, filter_gpu_type, nodes)
         elif view_mode == "users":
-            y = draw_partition_bars(stdscr, y, partitions, gpu_by_type, total_gpus, total_gpu_alloc, width)
-            y = draw_node_summary(stdscr, y, node_states, width)
+            y = draw_partition_bars(stdscr, y, partitions, nodes, width)
+            y = draw_node_summary(stdscr, y, nodes.get("node_states", {}), width)
             y = draw_user_table(stdscr, y, user_summary, width, current_user)
-
         elif view_mode == "my_jobs":
-            result = draw_my_jobs(stdscr, y, jobs, width, current_user, scroll_offset)
-            if isinstance(result, tuple):
-                y, scroll_offset = result
-            else:
-                y = result
-
+            y, scroll = draw_my_jobs(stdscr, y, jobs, width, current_user, scroll, nodes, priority_data)
         elif view_mode == "priority":
-            result = draw_priority(stdscr, y, priority_data, width, scroll_offset)
-            if isinstance(result, tuple):
-                y, scroll_offset = result
-            else:
-                y = result
-
+            y, scroll = draw_priority(stdscr, y, priority_data, width, current_user, scroll, not show_all)
         elif view_mode == "fairshare":
-            y = draw_fairshare(stdscr, y, fs_data, width)
-
+            y = draw_fairshare(stdscr, y, fs_tree, width, current_user)
         elif view_mode == "leaderboard":
-            result = draw_leaderboard(stdscr, y, leaderboard, width, current_user, scroll_offset)
-            if isinstance(result, tuple):
-                y, scroll_offset = result
-            else:
-                y = result
-
+            y, scroll = draw_leaderboard(stdscr, y, fs_tree, width, current_user, scroll,
+                                         lb_level, lb_acct_idx, lb_show_idle)
         elif view_mode == "history":
-            result = draw_history(stdscr, y, history, width, scroll_offset)
-            if isinstance(result, tuple):
-                y, scroll_offset = result
-            else:
-                y = result
-
+            y, scroll = draw_history(stdscr, y, history, width, scroll)
         draw_footer(stdscr, height, width, view_mode)
         stdscr.refresh()
 
-        # Input
         try:
             ch = stdscr.getch()
         except curses.error:
             ch = -1
-
         if ch == -1:
             continue
-        elif ch == ord('q') or ch == ord('Q'):
+        c = chr(ch).lower() if 0 <= ch < 256 else ""
+
+        def switch(view):
+            nonlocal view_mode, scroll
+            view_mode, scroll = view, 0
+
+        if c == 'q':
             break
-        elif ch == ord('r') or ch == ord('R'):
-            last_fetch = 0
-            last_slow_fetch = 0
-        elif ch == ord('1'):
-            view_mode = "main"
-            scroll_offset = 0
-        elif ch == ord('2'):
-            view_mode = "my_jobs"
-            scroll_offset = 0
-            last_slow_fetch = 0  # trigger fetch
-        elif ch == ord('3'):
-            view_mode = "priority"
-            scroll_offset = 0
-            last_slow_fetch = 0
-        elif ch == ord('4'):
-            view_mode = "fairshare"
-            scroll_offset = 0
-            last_slow_fetch = 0
-        elif ch == ord('5'):
-            view_mode = "leaderboard"
-            scroll_offset = 0
-            last_slow_fetch = 0
-        elif ch == ord('6'):
-            view_mode = "history"
-            scroll_offset = 0
-            last_slow_fetch = 0
-        elif ch == ord('a') or ch == ord('A'):
-            show_all = True
-            filter_user = ""
-            scroll_offset = 0
-        elif ch == ord('m') or ch == ord('M'):
-            show_all = False
-            filter_user = ""
-            scroll_offset = 0
-        elif ch == ord('s') or ch == ord('S'):
+        elif c == 'r':
+            last_fetch = last_slow_fetch = 0
+        elif c == '1':
+            switch("main")
+        elif c == '2':
+            switch("my_jobs")
+        elif c == '3':
+            switch("priority")
+        elif c == '4':
+            switch("fairshare")
+        elif c == '5':
+            switch("leaderboard")
+        elif c == '6':
+            switch("history")
+        elif c == 'u':
+            switch("users" if view_mode != "users" else "main")
+        elif c == 'a':
+            show_all, filter_user, scroll = True, "", 0
+        elif c == 'm':
+            show_all, filter_user, scroll = False, "", 0
+        elif c == 's':
             sort_idx = (sort_idx + 1) % len(sort_keys)
-            sort_key = sort_keys[sort_idx]
-            scroll_offset = 0
-        elif ch == ord('u') or ch == ord('U'):
-            view_mode = "users" if view_mode != "users" else "main"
-            scroll_offset = 0
-        elif ch == ord('/'):
-            curses.curs_set(1)
-            stdscr.nodelay(False)
-            try:
-                safe_addstr(stdscr, height - 1, 0, " " * (width - 1), curses.color_pair(5))
-                safe_addstr(stdscr, height - 1, 1, "Filter user: ", curses.color_pair(5))
-                stdscr.refresh()
-                curses.echo()
-                inp = stdscr.getstr(height - 1, 14, 20).decode("utf-8").strip()
-                curses.noecho()
-            except curses.error:
-                inp = ""
-            curses.curs_set(0)
-            stdscr.nodelay(True)
-            stdscr.timeout(300)
+            scroll = 0
+        elif c == 'l':
+            lb_level, scroll = ("user" if lb_level == "acct" else "acct"), 0
+        elif c == 't':
+            lb_acct_idx, scroll = lb_acct_idx + 1, 0
+        elif c == 'i':
+            lb_show_idle, scroll = not lb_show_idle, 0
+        elif c == '/':
+            inp = prompt_input(stdscr, height, width, "Filter user: ")
+            filter_user = inp
             if inp:
-                filter_user = inp
                 show_all = True
-                scroll_offset = 0
-            else:
-                filter_user = ""
-        elif ch == ord('p') or ch == ord('P'):
-            curses.curs_set(1)
-            stdscr.nodelay(False)
-            try:
-                safe_addstr(stdscr, height - 1, 0, " " * (width - 1), curses.color_pair(5))
-                avail = ", ".join(sorted(partitions.keys())) if partitions else ""
-                prompt = f"Partition [{avail}]: "
-                safe_addstr(stdscr, height - 1, 1, prompt[:width - 2], curses.color_pair(5))
-                stdscr.refresh()
-                curses.echo()
-                inp = stdscr.getstr(height - 1, min(len(prompt) + 1, width - 2), 20).decode("utf-8").strip()
-                curses.noecho()
-            except curses.error:
-                inp = ""
-            curses.curs_set(0)
-            stdscr.nodelay(True)
-            stdscr.timeout(300)
-            if inp and inp in partitions:
-                filter_partition = inp
-            else:
-                filter_partition = ""
-            scroll_offset = 0
-        elif ch == ord('g') or ch == ord('G'):
-            curses.curs_set(1)
-            stdscr.nodelay(False)
-            try:
-                safe_addstr(stdscr, height - 1, 0, " " * (width - 1), curses.color_pair(5))
-                avail = ", ".join(sorted(gpu_by_type.keys())) if gpu_by_type else ""
-                prompt = f"GPU type [{avail}]: "
-                safe_addstr(stdscr, height - 1, 1, prompt[:width - 2], curses.color_pair(5))
-                stdscr.refresh()
-                curses.echo()
-                inp = stdscr.getstr(height - 1, min(len(prompt) + 1, width - 2), 20).decode("utf-8").strip()
-                curses.noecho()
-            except curses.error:
-                inp = ""
-            curses.curs_set(0)
-            stdscr.nodelay(True)
-            stdscr.timeout(300)
-            filter_gpu_type = inp if inp else ""
-            scroll_offset = 0
+            scroll = 0
+        elif c == 'p':
+            avail = ", ".join(sorted(partitions)) if partitions else ""
+            inp = prompt_input(stdscr, height, width, f"Partition [{avail}]: ")
+            filter_partition = inp if inp in partitions else ""
+            scroll = 0
+        elif c == 'g':
+            avail = ", ".join(sorted(nodes.get("gpu_by_type", {}))) if nodes else ""
+            filter_gpu_type = prompt_input(stdscr, height, width, f"GPU type [{avail}]: ")
+            scroll = 0
         elif ch == curses.KEY_UP:
-            scroll_offset = max(0, scroll_offset - 1)
+            scroll = max(0, scroll - 1)
         elif ch == curses.KEY_DOWN:
-            scroll_offset += 1
+            scroll += 1
         elif ch == curses.KEY_PPAGE:
-            scroll_offset = max(0, scroll_offset - 20)
+            scroll = max(0, scroll - 20)
         elif ch == curses.KEY_NPAGE:
-            scroll_offset += 20
+            scroll += 20
         elif ch == curses.KEY_HOME:
-            scroll_offset = 0
-        elif ch == ord('+') or ch == ord('='):
+            scroll = 0
+        elif c in ('+', '='):
             REFRESH_INTERVAL = min(30, REFRESH_INTERVAL + 1)
-        elif ch == ord('-') or ch == ord('_'):
+        elif c in ('-', '_'):
             REFRESH_INTERVAL = max(1, REFRESH_INTERVAL - 1)
 
 
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+def parse_args():
+    ap = argparse.ArgumentParser(prog="slurm-top", description="htop-like Slurm dashboard; --json for a one-shot snapshot.")
+    ap.add_argument("--json", action="store_true", help="print a JSON snapshot and exit (no TUI)")
+    ap.add_argument("--compact", action="store_true", help="with --json: single-line output")
+    ap.add_argument("-u", "--user", default=None, help="user to report on (default: $USER)")
+    ap.add_argument("--days", type=int, default=7, help="history window in days (default 7)")
+    ap.add_argument("-i", "--interval", type=int, default=None, help="TUI refresh interval in seconds")
+    return ap.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    current_user = args.user or os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+    load_cluster_config()
+    if args.interval:
+        REFRESH_INTERVAL = max(1, args.interval)
+    if args.json:
+        snap = collect_snapshot(current_user, history_days=args.days)
+        if args.compact:
+            print(json.dumps(snap, separators=(",", ":"), default=str))
+        else:
+            print(json.dumps(snap, indent=2, default=str))
+        sys.exit(0)
     signal.signal(signal.SIGWINCH, lambda *a: None)
     try:
-        curses.wrapper(main)
+        curses.wrapper(main, current_user)
     except KeyboardInterrupt:
         pass
