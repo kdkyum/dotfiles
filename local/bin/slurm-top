@@ -444,8 +444,28 @@ def get_jobs():
             "account": p[13].strip() if len(p) > 13 else "",
             "priority": _int(p[14]) if len(p) > 14 else 0,
             "qos": p[15].strip() if len(p) > 15 else "",
+            "tasks": array_task_count(p[0].strip()),
         })
     return jobs
+
+
+def array_task_count(job_id):
+    """Number of tasks a squeue row stands for: '123_[1-14]' -> 14, '123_[2,5-7%3]' -> 4, else 1."""
+    m = re.search(r'_\[([^\]]+)\]', job_id)
+    if not m:
+        return 1
+    spec = m.group(1).split("%", 1)[0]
+    n = 0
+    for part in spec.split(","):
+        if "-" in part:
+            a, b = part.split("-", 1)
+            try:
+                n += int(b) - int(a) + 1
+            except ValueError:
+                n += 1
+        elif part.strip():
+            n += 1
+    return max(1, n)
 
 
 def base_job_id(job_id):
@@ -775,9 +795,9 @@ def collect_snapshot(current_user, history_days=7, leaderboard_limit=50):
             for t, v in gpu_by_type.items()
         },
         "by_partition": nodes["gpu_by_partition"],
-        "pending_requests": sum(job_gpu_count(j) for j in pending),
+        "pending_requests": sum(job_gpu_count(j) * j["tasks"] for j in pending),
         "my_running": sum(j["gpu_count"] for j in my_jobs if j["state"] == "RUNNING"),
-        "my_pending": sum(j["gpu_count"] for j in my_jobs if j["state"] == "PENDING"),
+        "my_pending": sum(j["gpu_count"] * j["tasks"] for j in my_jobs if j["state"] == "PENDING"),
     }
 
     top_users = sorted(user_summary.items(), key=lambda kv: (kv[1]["gpus"], kv[1]["running"]), reverse=True)
@@ -793,15 +813,17 @@ def collect_snapshot(current_user, history_days=7, leaderboard_limit=50):
         "partitions": sorted(partitions.values(), key=lambda p: (not p["default"], not p["has_gpu"], p["name"])),
         "nodes": {"total": nodes["n_nodes"], "states": nodes["node_states"]},
         "queue": {
-            "running": len(running), "pending": len(pending),
-            "other": len(jobs) - len(running) - len(pending), "total": len(jobs),
+            "running": sum(j["tasks"] for j in running), "pending": sum(j["tasks"] for j in pending),
+            "other": len(jobs) - len(running) - len(pending), "total": sum(j["tasks"] for j in jobs),
             "users_active": len(user_summary),
             "top_users": [dict(stats, user=u) for u, stats in top_users[:15]],
         },
         "my_jobs": {
-            "running": sum(1 for j in my_jobs if j["state"] == "RUNNING"),
-            "pending": sum(1 for j in my_jobs if j["state"] == "PENDING"),
-            "total": len(my_jobs),
+            # counts are array tasks, not squeue rows ('123_[1-14]' counts 14)
+            "running": sum(j["tasks"] for j in my_jobs if j["state"] == "RUNNING"),
+            "pending": sum(j["tasks"] for j in my_jobs if j["state"] == "PENDING"),
+            "total": sum(j["tasks"] for j in my_jobs),
+            "rows": len(my_jobs),
             "jobs": sorted(my_jobs, key=lambda j: (j["state"] != "RUNNING", j["state"] != "PENDING", j["id"])),
         },
         "priority": {
@@ -1106,9 +1128,9 @@ def draw_my_jobs(win, y, jobs, width, current_user, scroll, nodes, priority_data
     if not my_jobs:
         safe_addstr(win, y, 2, "No active jobs.", curses.color_pair(7) | curses.A_DIM)
         return y + 2, scroll
-    running = sum(1 for j in my_jobs if j["state"] == "RUNNING")
-    pending = sum(1 for j in my_jobs if j["state"] == "PENDING")
-    other = len(my_jobs) - running - pending
+    running = sum(j["tasks"] for j in my_jobs if j["state"] == "RUNNING")
+    pending = sum(j["tasks"] for j in my_jobs if j["state"] == "PENDING")
+    other = sum(j["tasks"] for j in my_jobs) - running - pending
     gpus_run = sum(job_gpu_count(j) for j in my_jobs if j["state"] == "RUNNING")
     summary = f" Running: {running} ({gpus_run} GPUs)  Pending: {pending}" + (f"  Other: {other}" if other else "")
     rank_by_id = {p["id"]: p["rank"] for p in priority_data}
