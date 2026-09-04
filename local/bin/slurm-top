@@ -70,6 +70,12 @@ PROFILES = {
         "partition_notes": {
             "spyder": "CPU only",
         },
+        # Access is per account; each account unlocks only these GPU types.
+        # GPUs of other types are reported but marked "not usable".
+        "account_gpu_types": {
+            "aics_h100": ["h100"],
+            "aics_h200": ["h200"],
+        },
     },
 }
 
@@ -617,6 +623,17 @@ def hours_to_fair(level_fs):
     return math.log2(1.0 / lfs) * hl / 3600.0
 
 
+def usable_gpu_types(gpu_by_type, my_accounts):
+    """GPU types the user may actually use. Without a profile rule, all of them."""
+    rule = PROFILE.get("account_gpu_types")
+    if not rule:
+        return sorted(gpu_by_type)
+    allowed = set()
+    for acct in my_accounts:
+        allowed.update(rule.get(acct, []))
+    return sorted(t for t in gpu_by_type if t in allowed)
+
+
 def fairshare_summary(tree, current_user):
     """Per account I belong to: my row, the account row, ranks, members."""
     out = []
@@ -732,7 +749,17 @@ def collect_snapshot(current_user, history_days=7, leaderboard_limit=50):
     pending = [j for j in jobs if j["state"] == "PENDING"]
 
     gpu_by_type = nodes["gpu_by_type"]
+    my_account_names = [m["account"] for m in tree.get("my_accounts", [])]
+    usable_types = usable_gpu_types(gpu_by_type, my_account_names)
+    usable_rows = [gpu_by_type[t] for t in usable_types]
     gpus = {
+        "usable_types": usable_types,
+        "usable": {
+            "total": sum(v["total"] for v in usable_rows),
+            "allocated": sum(v["alloc"] for v in usable_rows),
+            "free": sum(v["total"] - v["alloc"] for v in usable_rows),
+            "unavailable": sum(v["unavail"] for v in usable_rows),
+        },
         "total": nodes["total_gpus"],
         "allocated": nodes["total_gpu_alloc"],
         "free": nodes["total_gpus"] - nodes["total_gpu_alloc"],
@@ -871,7 +898,7 @@ def draw_header(win, y, width, current_user, view_name):
     return y + 1
 
 
-def draw_partition_bars(win, y, partitions, nodes, width):
+def draw_partition_bars(win, y, partitions, nodes, width, usable_types=None):
     bar_width = max(10, min(50, width - 40))
     label_width = 20
     info_col = label_width + bar_width + 22
@@ -897,6 +924,9 @@ def draw_partition_bars(win, y, partitions, nodes, width):
             safe_addstr(win, y, info_col, info, curses.color_pair(7) | curses.A_DIM)
             if g["unavail"] > 0:
                 safe_addstr(win, y, info_col + len(info), f" ({g['unavail']} unavail)", curses.color_pair(3))
+                info += f" ({g['unavail']} unavail)"
+            if usable_types is not None and gtype not in usable_types:
+                safe_addstr(win, y, info_col + len(info), " not usable by me", curses.color_pair(7) | curses.A_DIM)
         y += 1
     if not gpu_by_type:
         safe_addstr(win, y, 2, "No GPUs in this cluster.", curses.color_pair(7) | curses.A_DIM)
@@ -1409,6 +1439,9 @@ def main(stdscr, current_user):
 
     partitions, nodes, jobs, user_summary = {}, {}, [], {}
     priority_data, fs_tree, history = [], {}, []
+    usable_types = None
+    if PROFILE.get("account_gpu_types"):
+        fs_tree = get_sshare_tree(current_user)
     last_fetch = last_slow_fetch = 0
     fetched_slow = set()
 
@@ -1418,6 +1451,8 @@ def main(stdscr, current_user):
             partitions, nodes, jobs = fetch_fast()
             annotate_partitions(partitions, nodes)
             user_summary = get_user_summary(jobs)
+            if PROFILE.get("account_gpu_types") and fs_tree:
+                usable_types = usable_gpu_types(nodes["gpu_by_type"], [m["account"] for m in fs_tree["my_accounts"]])
             last_fetch = now
         if now - last_slow_fetch >= SLOW_INTERVAL or view_mode not in fetched_slow:
             if view_mode in ("priority", "my_jobs"):
@@ -1439,12 +1474,12 @@ def main(stdscr, current_user):
 
         y = draw_header(stdscr, 0, width, current_user, VIEW_NAMES.get(view_mode, ""))
         if view_mode == "main":
-            y = draw_partition_bars(stdscr, y, partitions, nodes, width)
+            y = draw_partition_bars(stdscr, y, partitions, nodes, width, usable_types)
             y = draw_node_summary(stdscr, y, nodes.get("node_states", {}), width)
             y, scroll = draw_job_table(stdscr, y, jobs, width, scroll, sort_keys[sort_idx], current_user,
                                        show_all, filter_user, filter_partition, filter_gpu_type, nodes)
         elif view_mode == "users":
-            y = draw_partition_bars(stdscr, y, partitions, nodes, width)
+            y = draw_partition_bars(stdscr, y, partitions, nodes, width, usable_types)
             y = draw_node_summary(stdscr, y, nodes.get("node_states", {}), width)
             y = draw_user_table(stdscr, y, user_summary, width, current_user)
         elif view_mode == "my_jobs":
