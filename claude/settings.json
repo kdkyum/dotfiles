@@ -1,25 +1,11 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash",
-      "Edit",
-      "Write",
-      "Read",
-      "Grep",
-      "Glob",
-      "WebFetch",
-      "WebSearch",
-      "Task",
-      "NotebookEdit",
-      "mcp__jlab-mcp__*"
-    ],
-    "deny": [
-      "Bash(rm -rf *)",
-      "Bash(sudo *)"
-    ]
+  "env": {
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   },
-  "model": "claude-fable-5[1m]",
-  "preferredNotifChannel": "notifications_disabled",
+  "model": "opus",
   "hooks": {
     "PostToolUse": [
       {
@@ -64,7 +50,11 @@
     "claude-md-management@claude-plugins-official": false,
     "skill-creator@claude-plugins-official": false,
     "research-tools@kdkyum-research-tools": true,
-    "commit-commands@claude-plugins-official": false
+    "commit-commands@claude-plugins-official": false,
+    "dbxcli@dbxcli": true,
+    "frontend-design@anthropic-plugin-directory": true,
+    "cc-plugin-telemetry@builtin": false,
+    "pdf-viewer@synced": false
   },
   "extraKnownMarketplaces": {
     "kdkyum-research-tools": {
@@ -72,10 +62,23 @@
         "source": "github",
         "repo": "kdkyum/research-tools"
       }
+    },
+    "dbxcli": {
+      "source": {
+        "source": "github",
+        "repo": "Dropbox/dbxcli"
+      }
     }
   },
+  "feedbackDrafts": "off",
   "effortLevel": "high",
   "tui": "fullscreen",
   "theme": "dark",
-  "remoteControlAtStartup": false
+  "preferredNotifChannel": "ghostty",
+  "idleCompaction": false,
+  "switchModelsOnFlag": true,
+  "terminalProgressBarEnabled": true,
+  "remoteControlAtStartup": true,
+  "inputNeededNotifEnabled": true,
+  "agentPushNotifEnabled": true
 }
